@@ -18,10 +18,9 @@
 //! Utilizing exact statistics from sources to avoid scanning data
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use crate::config::ConfigOptions;
 use datafusion_expr::utils::COUNT_STAR_EXPANSION;
 
-use crate::execution::context::SessionConfig;
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use crate::physical_plan::empty::EmptyExec;
 use crate::physical_plan::projection::ProjectionExec;
@@ -52,7 +51,7 @@ impl PhysicalOptimizerRule for AggregateStatistics {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        config: &SessionConfig,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(partial_agg_exec) = take_optimizable(&*plan) {
             let partial_agg_exec = partial_agg_exec
@@ -85,7 +84,7 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 // input can be entirely removed
                 Ok(Arc::new(ProjectionExec::try_new(
                     projections,
-                    Arc::new(EmptyExec::new(true, Arc::new(Schema::empty()))),
+                    Arc::new(EmptyExec::new(true, plan.schema())),
                 )?))
             } else {
                 optimize_children(self, plan, config)
@@ -98,14 +97,19 @@ impl PhysicalOptimizerRule for AggregateStatistics {
     fn name(&self) -> &str {
         "aggregate_statistics"
     }
+
+    /// This rule will change the nullable properties of the schema, disable the schema check.
+    fn schema_check(&self) -> bool {
+        false
+    }
 }
 
 /// assert if the node passed as argument is a final `AggregateExec` node that can be optimized:
-/// - its child (with posssible intermediate layers) is a partial `AggregateExec` node
+/// - its child (with possible intermediate layers) is a partial `AggregateExec` node
 /// - they both have no grouping expression
 /// - the statistics are exact
 /// If this is the case, return a ref to the partial `AggregateExec`, else `None`.
-/// We would have prefered to return a casted ref to AggregateExec but the recursion requires
+/// We would have preferred to return a casted ref to AggregateExec but the recursion requires
 /// the `ExecutionPlan.children()` method that returns an owned reference.
 fn take_optimizable(node: &dyn ExecutionPlan) -> Option<Arc<dyn ExecutionPlan>> {
     if let Some(final_agg_exec) = node.as_any().downcast_ref::<AggregateExec>() {
@@ -258,13 +262,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion_common::cast::as_int64_array;
+    use datafusion_physical_expr::expressions::cast;
     use datafusion_physical_expr::PhysicalExpr;
 
     use crate::error::Result;
-    use crate::logical_plan::Operator;
+    use crate::logical_expr::Operator;
     use crate::physical_plan::aggregates::{AggregateExec, PhysicalGroupBy};
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::common;
@@ -301,9 +307,10 @@ mod tests {
         agg: TestAggregate,
     ) -> Result<()> {
         let session_ctx = SessionContext::new();
-        let conf = session_ctx.copied_config();
+        let state = session_ctx.state();
         let plan = Arc::new(plan) as _;
-        let optimized = AggregateStatistics::new().optimize(Arc::clone(&plan), &conf)?;
+        let optimized = AggregateStatistics::new()
+            .optimize(Arc::clone(&plan), state.config_options())?;
 
         // A ProjectionExec is a sign that the count optimization was applied
         assert!(optimized.as_any().is::<ProjectionExec>());
@@ -336,12 +343,7 @@ mod tests {
         // note that nullabiolity differs
 
         assert_eq!(
-            batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values(),
+            as_int64_array(batch.column(0)).unwrap().values(),
             &[agg.expected_count()]
         );
     }
@@ -525,7 +527,7 @@ mod tests {
             expressions::binary(
                 expressions::col("a", &schema)?,
                 Operator::Gt,
-                expressions::lit(1u32),
+                cast(expressions::lit(1u32), &schema, DataType::Int32)?,
                 &schema,
             )?,
             source,
@@ -547,7 +549,7 @@ mod tests {
             Arc::clone(&schema),
         )?;
 
-        let conf = SessionConfig::new();
+        let conf = ConfigOptions::new();
         let optimized =
             AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)?;
 
@@ -568,7 +570,7 @@ mod tests {
             expressions::binary(
                 expressions::col("a", &schema)?,
                 Operator::Gt,
-                expressions::lit(1u32),
+                cast(expressions::lit(1u32), &schema, DataType::Int32)?,
                 &schema,
             )?,
             source,
@@ -590,7 +592,7 @@ mod tests {
             Arc::clone(&schema),
         )?;
 
-        let conf = SessionConfig::new();
+        let conf = ConfigOptions::new();
         let optimized =
             AggregateStatistics::new().optimize(Arc::new(final_agg), &conf)?;
 

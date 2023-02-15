@@ -18,9 +18,11 @@
 #![doc = include_str!("../README.md")]
 pub const DATAFUSION_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod catalog;
 pub mod command;
 pub mod exec;
 pub mod functions;
 pub mod helper;
+pub mod object_storage;
 pub mod print_format;
 pub mod print_options;

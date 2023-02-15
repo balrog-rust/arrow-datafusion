@@ -16,15 +16,20 @@
 // under the License.
 
 use clap::Parser;
-use datafusion::error::Result;
+use datafusion::datasource::object_store::ObjectStoreRegistry;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionConfig;
+use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion::prelude::SessionContext;
+use datafusion_cli::catalog::DynamicFileCatalog;
+use datafusion_cli::object_storage::DatafusionCliObjectStoreProvider;
 use datafusion_cli::{
     exec, print_format::PrintFormat, print_options::PrintOptions, DATAFUSION_CLI_VERSION,
 };
 use mimalloc::MiMalloc;
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -89,16 +94,24 @@ pub async fn main() -> Result<()> {
 
     if let Some(ref path) = args.data_path {
         let p = Path::new(path);
-        env::set_current_dir(&p).unwrap();
+        env::set_current_dir(p).unwrap();
     };
 
-    let mut session_config = SessionConfig::from_env().with_information_schema(true);
+    let mut session_config = SessionConfig::from_env()?.with_information_schema(true);
 
     if let Some(batch_size) = args.batch_size {
         session_config = session_config.with_batch_size(batch_size);
     };
 
-    let mut ctx = SessionContext::with_config(session_config.clone());
+    let runtime_env = create_runtime_env()?;
+    let mut ctx =
+        SessionContext::with_config_rt(session_config.clone(), Arc::new(runtime_env));
+    ctx.refresh_catalogs().await?;
+    // install dynamic catalog provider that knows how to open files
+    ctx.register_catalog_list(Arc::new(DynamicFileCatalog::new(
+        ctx.state().catalog_list(),
+        ctx.state_weak_ref(),
+    )));
 
     let mut print_options = PrintOptions {
         format: args.format,
@@ -120,19 +133,31 @@ pub async fn main() -> Result<()> {
             files
         }
     };
+
     if !files.is_empty() {
-        exec::exec_from_files(files, &mut ctx, &print_options).await
+        exec::exec_from_files(files, &mut ctx, &print_options).await;
+        Ok(())
     } else {
         if !rc.is_empty() {
             exec::exec_from_files(rc, &mut ctx, &print_options).await
         }
-        exec::exec_from_repl(&mut ctx, &mut print_options).await;
+        // TODO maybe we can have thiserror for cli but for now let's keep it simple
+        exec::exec_from_repl(&mut ctx, &mut print_options)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
-
-    Ok(())
 }
 
-fn is_valid_file(dir: &str) -> std::result::Result<(), String> {
+fn create_runtime_env() -> Result<RuntimeEnv> {
+    let object_store_provider = DatafusionCliObjectStoreProvider {};
+    let object_store_registry =
+        ObjectStoreRegistry::new_with_provider(Some(Arc::new(object_store_provider)));
+    let rn_config =
+        RuntimeConfig::new().with_object_store_registry(Arc::new(object_store_registry));
+    RuntimeEnv::new(rn_config)
+}
+
+fn is_valid_file(dir: &str) -> Result<(), String> {
     if Path::new(dir).is_file() {
         Ok(())
     } else {
@@ -140,7 +165,7 @@ fn is_valid_file(dir: &str) -> std::result::Result<(), String> {
     }
 }
 
-fn is_valid_data_dir(dir: &str) -> std::result::Result<(), String> {
+fn is_valid_data_dir(dir: &str) -> Result<(), String> {
     if Path::new(dir).is_dir() {
         Ok(())
     } else {
@@ -148,7 +173,7 @@ fn is_valid_data_dir(dir: &str) -> std::result::Result<(), String> {
     }
 }
 
-fn is_valid_batch_size(size: &str) -> std::result::Result<(), String> {
+fn is_valid_batch_size(size: &str) -> Result<(), String> {
     match size.parse::<usize>() {
         Ok(size) if size > 0 => Ok(()),
         _ => Err(format!("Invalid batch size '{}'", size)),

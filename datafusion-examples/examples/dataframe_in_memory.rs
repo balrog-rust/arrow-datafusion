@@ -20,7 +20,6 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int32Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::MemTable;
 use datafusion::error::Result;
 use datafusion::from_slice::FromSlice;
 use datafusion::prelude::*;
@@ -36,10 +35,10 @@ async fn main() -> Result<()> {
 
     // define data.
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        schema,
         vec![
-            Arc::new(StringArray::from_slice(&["a", "b", "c", "d"])),
-            Arc::new(Int32Array::from_slice(&[1, 10, 10, 100])),
+            Arc::new(StringArray::from_slice(["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from_slice([1, 10, 10, 100])),
         ],
     )?;
 
@@ -47,9 +46,8 @@ async fn main() -> Result<()> {
     let ctx = SessionContext::new();
 
     // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
-    let provider = MemTable::try_new(schema, vec![vec![batch]])?;
-    ctx.register_table("t", Arc::new(provider))?;
-    let df = ctx.table("t")?;
+    ctx.register_batch("t", batch)?;
+    let df = ctx.table("t").await?;
 
     // construct an expression corresponding to "SELECT a, b FROM t WHERE b = 10" in SQL
     let filter = col("b").eq(lit(10));

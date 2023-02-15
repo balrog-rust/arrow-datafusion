@@ -51,10 +51,6 @@ pub enum Operator {
     And,
     /// Logical OR, like `||`
     Or,
-    /// Matches a wildcard pattern
-    Like,
-    /// Does not match a wildcard pattern
-    NotLike,
     /// IS DISTINCT FROM
     IsDistinctFrom,
     /// IS NOT DISTINCT FROM
@@ -71,8 +67,81 @@ pub enum Operator {
     BitwiseAnd,
     /// Bitwise or, like `|`
     BitwiseOr,
+    /// Bitwise xor, like `#`
+    BitwiseXor,
+    /// Bitwise right, like `>>`
+    BitwiseShiftRight,
+    /// Bitwise left, like `<<`
+    BitwiseShiftLeft,
     /// String concat
     StringConcat,
+}
+
+impl Operator {
+    /// If the operator can be negated, return the negated operator
+    /// otherwise return None
+    pub fn negate(&self) -> Option<Operator> {
+        match self {
+            Operator::Eq => Some(Operator::NotEq),
+            Operator::NotEq => Some(Operator::Eq),
+            Operator::Lt => Some(Operator::GtEq),
+            Operator::LtEq => Some(Operator::Gt),
+            Operator::Gt => Some(Operator::LtEq),
+            Operator::GtEq => Some(Operator::Lt),
+            Operator::IsDistinctFrom => Some(Operator::IsNotDistinctFrom),
+            Operator::IsNotDistinctFrom => Some(Operator::IsDistinctFrom),
+            Operator::Plus
+            | Operator::Minus
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulo
+            | Operator::And
+            | Operator::Or
+            | Operator::RegexMatch
+            | Operator::RegexIMatch
+            | Operator::RegexNotMatch
+            | Operator::RegexNotIMatch
+            | Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseXor
+            | Operator::BitwiseShiftRight
+            | Operator::BitwiseShiftLeft
+            | Operator::StringConcat => None,
+        }
+    }
+
+    /// Return the operator where swapping lhs and rhs wouldn't change the result.
+    ///
+    /// For example `Binary(50, >=, a)` could also be represented as `Binary(a, <=, 50)`.
+    pub fn swap(&self) -> Option<Operator> {
+        match self {
+            Operator::Eq => Some(Operator::Eq),
+            Operator::NotEq => Some(Operator::NotEq),
+            Operator::Lt => Some(Operator::Gt),
+            Operator::LtEq => Some(Operator::GtEq),
+            Operator::Gt => Some(Operator::Lt),
+            Operator::GtEq => Some(Operator::LtEq),
+            Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
+            | Operator::Plus
+            | Operator::Minus
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulo
+            | Operator::And
+            | Operator::Or
+            | Operator::RegexMatch
+            | Operator::RegexIMatch
+            | Operator::RegexNotMatch
+            | Operator::RegexNotIMatch
+            | Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseXor
+            | Operator::BitwiseShiftRight
+            | Operator::BitwiseShiftLeft
+            | Operator::StringConcat => None,
+        }
+    }
 }
 
 impl fmt::Display for Operator {
@@ -91,8 +160,6 @@ impl fmt::Display for Operator {
             Operator::Modulo => "%",
             Operator::And => "AND",
             Operator::Or => "OR",
-            Operator::Like => "LIKE",
-            Operator::NotLike => "NOT LIKE",
             Operator::RegexMatch => "~",
             Operator::RegexIMatch => "~*",
             Operator::RegexNotMatch => "!~",
@@ -101,9 +168,12 @@ impl fmt::Display for Operator {
             Operator::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
             Operator::BitwiseAnd => "&",
             Operator::BitwiseOr => "|",
+            Operator::BitwiseXor => "#",
+            Operator::BitwiseShiftRight => ">>",
+            Operator::BitwiseShiftLeft => "<<",
             Operator::StringConcat => "||",
         };
-        write!(f, "{}", display)
+        write!(f, "{display}")
     }
 }
 

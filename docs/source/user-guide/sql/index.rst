@@ -21,8 +21,12 @@ SQL Reference
 .. toctree::
    :maxdepth: 2
 
-   sql_status
+   data_types
    select
+   subqueries
    ddl
+   explain
+   information_schema
    aggregate_functions
    scalar_functions
+   sql_status

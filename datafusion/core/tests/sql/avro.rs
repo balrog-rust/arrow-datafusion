@@ -21,7 +21,7 @@ async fn register_alltypes_avro(ctx: &SessionContext) {
     let testdata = datafusion::test_util::arrow_test_data();
     ctx.register_avro(
         "alltypes_plain",
-        &format!("{}/avro/alltypes_plain.avro", testdata),
+        &format!("{testdata}/avro/alltypes_plain.avro"),
         AvroReadOptions::default(),
     )
     .await
@@ -37,18 +37,18 @@ async fn avro_query() {
     let sql = "SELECT id, CAST(string_col AS varchar) FROM alltypes_plain";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+----+-----------------------------------------+",
-        "| id | CAST(alltypes_plain.string_col AS Utf8) |",
-        "+----+-----------------------------------------+",
-        "| 4  | 0                                       |",
-        "| 5  | 1                                       |",
-        "| 6  | 0                                       |",
-        "| 7  | 1                                       |",
-        "| 2  | 0                                       |",
-        "| 3  | 1                                       |",
-        "| 0  | 0                                       |",
-        "| 1  | 1                                       |",
-        "+----+-----------------------------------------+",
+        "+----+---------------------------+",
+        "| id | alltypes_plain.string_col |",
+        "+----+---------------------------+",
+        "| 4  | 0                         |",
+        "| 5  | 1                         |",
+        "| 6  | 0                         |",
+        "| 7  | 1                         |",
+        "| 2  | 0                         |",
+        "| 3  | 1                         |",
+        "| 0  | 0                         |",
+        "| 1  | 1                         |",
+        "+----+---------------------------+",
     ];
 
     assert_batches_eq!(expected, &actual);
@@ -59,7 +59,7 @@ async fn avro_query_multiple_files() {
     let tempdir = tempfile::tempdir().unwrap();
     let table_path = tempdir.path();
     let testdata = datafusion::test_util::arrow_test_data();
-    let alltypes_plain_file = format!("{}/avro/alltypes_plain.avro", testdata);
+    let alltypes_plain_file = format!("{testdata}/avro/alltypes_plain.avro");
     std::fs::copy(
         &alltypes_plain_file,
         format!("{}/alltypes_plain1.avro", table_path.display()),
@@ -84,26 +84,26 @@ async fn avro_query_multiple_files() {
     let sql = "SELECT id, CAST(string_col AS varchar) FROM alltypes_plain";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+----+-----------------------------------------+",
-        "| id | CAST(alltypes_plain.string_col AS Utf8) |",
-        "+----+-----------------------------------------+",
-        "| 4  | 0                                       |",
-        "| 5  | 1                                       |",
-        "| 6  | 0                                       |",
-        "| 7  | 1                                       |",
-        "| 2  | 0                                       |",
-        "| 3  | 1                                       |",
-        "| 0  | 0                                       |",
-        "| 1  | 1                                       |",
-        "| 4  | 0                                       |",
-        "| 5  | 1                                       |",
-        "| 6  | 0                                       |",
-        "| 7  | 1                                       |",
-        "| 2  | 0                                       |",
-        "| 3  | 1                                       |",
-        "| 0  | 0                                       |",
-        "| 1  | 1                                       |",
-        "+----+-----------------------------------------+",
+        "+----+---------------------------+",
+        "| id | alltypes_plain.string_col |",
+        "+----+---------------------------+",
+        "| 4  | 0                         |",
+        "| 5  | 1                         |",
+        "| 6  | 0                         |",
+        "| 7  | 1                         |",
+        "| 2  | 0                         |",
+        "| 3  | 1                         |",
+        "| 0  | 0                         |",
+        "| 1  | 1                         |",
+        "| 4  | 0                         |",
+        "| 5  | 1                         |",
+        "| 6  | 0                         |",
+        "| 7  | 1                         |",
+        "| 2  | 0                         |",
+        "| 3  | 1                         |",
+        "| 0  | 0                         |",
+        "| 1  | 1                         |",
+        "+----+---------------------------+",
     ];
 
     assert_batches_eq!(expected, &actual);
@@ -115,17 +115,14 @@ async fn avro_single_nan_schema() {
     let testdata = datafusion::test_util::arrow_test_data();
     ctx.register_avro(
         "single_nan",
-        &format!("{}/avro/single_nan.avro", testdata),
+        &format!("{testdata}/avro/single_nan.avro"),
         AvroReadOptions::default(),
     )
     .await
     .unwrap();
     let sql = "SELECT mycol FROM single_nan";
-    let plan = ctx.create_logical_plan(sql).unwrap();
-    let plan = ctx.optimize(&plan).unwrap();
-    let plan = ctx.create_physical_plan(&plan).await.unwrap();
-    let runtime = ctx.task_ctx();
-    let results = collect(plan, runtime).await.unwrap();
+    let dataframe = ctx.sql(sql).await.unwrap();
+    let results = dataframe.collect().await.unwrap();
     for batch in results {
         assert_eq!(1, batch.num_rows());
         assert_eq!(1, batch.num_columns());
@@ -143,7 +140,7 @@ async fn avro_explain() {
     let expected = vec![
         vec![
             "logical_plan",
-            "Projection: #COUNT(UInt8(1))\
+            "Projection: COUNT(UInt8(1))\
             \n  Aggregate: groupBy=[[]], aggr=[[COUNT(UInt8(1))]]\
             \n    TableScan: alltypes_plain projection=[id]",
         ],
@@ -153,8 +150,8 @@ async fn avro_explain() {
             \n  AggregateExec: mode=Final, gby=[], aggr=[COUNT(UInt8(1))]\
             \n    CoalescePartitionsExec\
             \n      AggregateExec: mode=Partial, gby=[], aggr=[COUNT(UInt8(1))]\
-            \n        RepartitionExec: partitioning=RoundRobinBatch(NUM_CORES)\
-            \n          AvroExec: files=[ARROW_TEST_DATA/avro/alltypes_plain.avro], limit=None\
+            \n        RepartitionExec: partitioning=RoundRobinBatch(NUM_CORES), input_partitions=1\
+            \n          AvroExec: files={1 group: [[ARROW_TEST_DATA/avro/alltypes_plain.avro]]}, limit=None\
             \n",
         ],
     ];

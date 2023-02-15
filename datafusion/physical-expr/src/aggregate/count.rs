@@ -27,16 +27,16 @@ use arrow::array::Int64Array;
 use arrow::compute;
 use arrow::datatypes::DataType;
 use arrow::{array::ArrayRef, datatypes::Field};
-use datafusion_common::Result;
-use datafusion_common::ScalarValue;
-use datafusion_expr::{Accumulator, AggregateState};
+use datafusion_common::{downcast_value, ScalarValue};
+use datafusion_common::{DataFusionError, Result};
+use datafusion_expr::Accumulator;
 use datafusion_row::accessor::RowAccessor;
 
 use crate::expressions::format_state_name;
 
 /// COUNT aggregate expression
 /// Returns the amount of non-null values of the given expression.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Count {
     name: String,
     data_type: DataType,
@@ -76,7 +76,7 @@ impl AggregateExpr for Count {
 
     fn state_fields(&self) -> Result<Vec<Field>> {
         Ok(vec![Field::new(
-            &format_state_name(&self.name, "count"),
+            format_state_name(&self.name, "count"),
             self.data_type.clone(),
             true,
         )])
@@ -98,11 +98,23 @@ impl AggregateExpr for Count {
         true
     }
 
+    fn supports_bounded_execution(&self) -> bool {
+        true
+    }
+
     fn create_row_accumulator(
         &self,
         start_index: usize,
     ) -> Result<Box<dyn RowAccumulator>> {
         Ok(Box::new(CountRowAccumulator::new(start_index)))
+    }
+
+    fn reverse_expr(&self) -> Option<Arc<dyn AggregateExpr>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn create_sliding_accumulator(&self) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(CountAccumulator::new()))
     }
 }
 
@@ -119,14 +131,24 @@ impl CountAccumulator {
 }
 
 impl Accumulator for CountAccumulator {
+    fn state(&self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![ScalarValue::Int64(Some(self.count))])
+    }
+
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let array = &values[0];
         self.count += (array.len() - array.data().null_count()) as i64;
         Ok(())
     }
 
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let array = &values[0];
+        self.count -= (array.len() - array.data().null_count()) as i64;
+        Ok(())
+    }
+
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let counts = states[0].as_any().downcast_ref::<Int64Array>().unwrap();
+        let counts = downcast_value!(states[0], Int64Array);
         let delta = &compute::sum(counts);
         if let Some(d) = delta {
             self.count += *d;
@@ -134,14 +156,12 @@ impl Accumulator for CountAccumulator {
         Ok(())
     }
 
-    fn state(&self) -> Result<Vec<AggregateState>> {
-        Ok(vec![AggregateState::Scalar(ScalarValue::Int64(Some(
-            self.count,
-        )))])
-    }
-
     fn evaluate(&self) -> Result<ScalarValue> {
         Ok(ScalarValue::Int64(Some(self.count)))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
     }
 }
 
@@ -173,7 +193,7 @@ impl RowAccumulator for CountRowAccumulator {
         states: &[ArrayRef],
         accessor: &mut RowAccessor,
     ) -> Result<()> {
-        let counts = states[0].as_any().downcast_ref::<Int64Array>().unwrap();
+        let counts = downcast_value!(states[0], Int64Array);
         let delta = &compute::sum(counts);
         if let Some(d) = delta {
             accessor.add_i64(self.state_index, *d);
@@ -182,7 +202,9 @@ impl RowAccumulator for CountRowAccumulator {
     }
 
     fn evaluate(&self, accessor: &RowAccessor) -> Result<ScalarValue> {
-        Ok(accessor.get_as_scalar(&DataType::Int64, self.state_index))
+        Ok(ScalarValue::Int64(Some(
+            accessor.get_u64_opt(self.state_index()).unwrap_or(0) as i64,
+        )))
     }
 
     #[inline(always)]
@@ -204,13 +226,7 @@ mod tests {
     #[test]
     fn count_elements() -> Result<()> {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
-        generic_test_op!(
-            a,
-            DataType::Int32,
-            Count,
-            ScalarValue::from(5i64),
-            DataType::Int64
-        )
+        generic_test_op!(a, DataType::Int32, Count, ScalarValue::from(5i64))
     }
 
     #[test]
@@ -223,13 +239,7 @@ mod tests {
             Some(3),
             None,
         ]));
-        generic_test_op!(
-            a,
-            DataType::Int32,
-            Count,
-            ScalarValue::from(3i64),
-            DataType::Int64
-        )
+        generic_test_op!(a, DataType::Int32, Count, ScalarValue::from(3i64))
     }
 
     #[test]
@@ -237,51 +247,27 @@ mod tests {
         let a: ArrayRef = Arc::new(BooleanArray::from(vec![
             None, None, None, None, None, None, None, None,
         ]));
-        generic_test_op!(
-            a,
-            DataType::Boolean,
-            Count,
-            ScalarValue::from(0i64),
-            DataType::Int64
-        )
+        generic_test_op!(a, DataType::Boolean, Count, ScalarValue::from(0i64))
     }
 
     #[test]
     fn count_empty() -> Result<()> {
         let a: Vec<bool> = vec![];
         let a: ArrayRef = Arc::new(BooleanArray::from(a));
-        generic_test_op!(
-            a,
-            DataType::Boolean,
-            Count,
-            ScalarValue::from(0i64),
-            DataType::Int64
-        )
+        generic_test_op!(a, DataType::Boolean, Count, ScalarValue::from(0i64))
     }
 
     #[test]
     fn count_utf8() -> Result<()> {
         let a: ArrayRef =
             Arc::new(StringArray::from(vec!["a", "bb", "ccc", "dddd", "ad"]));
-        generic_test_op!(
-            a,
-            DataType::Utf8,
-            Count,
-            ScalarValue::from(5i64),
-            DataType::Int64
-        )
+        generic_test_op!(a, DataType::Utf8, Count, ScalarValue::from(5i64))
     }
 
     #[test]
     fn count_large_utf8() -> Result<()> {
         let a: ArrayRef =
             Arc::new(LargeStringArray::from(vec!["a", "bb", "ccc", "dddd", "ad"]));
-        generic_test_op!(
-            a,
-            DataType::LargeUtf8,
-            Count,
-            ScalarValue::from(5i64),
-            DataType::Int64
-        )
+        generic_test_op!(a, DataType::LargeUtf8, Count, ScalarValue::from(5i64))
     }
 }

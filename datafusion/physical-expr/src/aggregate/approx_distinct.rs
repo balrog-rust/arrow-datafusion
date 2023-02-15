@@ -28,10 +28,9 @@ use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type,
     UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use datafusion_common::ScalarValue;
+use datafusion_common::{downcast_value, ScalarValue};
 use datafusion_common::{DataFusionError, Result};
-use datafusion_expr::{Accumulator, AggregateState};
-use std::any::type_name;
+use datafusion_expr::Accumulator;
 use std::any::Any;
 use std::convert::TryFrom;
 use std::convert::TryInto;
@@ -74,7 +73,7 @@ impl AggregateExpr for ApproxDistinct {
 
     fn state_fields(&self) -> Result<Vec<Field>> {
         Ok(vec![Field::new(
-            &format_state_name(&self.name, "hll_registers"),
+            format_state_name(&self.name, "hll_registers"),
             DataType::Binary,
             false,
         )])
@@ -103,9 +102,8 @@ impl AggregateExpr for ApproxDistinct {
             DataType::LargeBinary => Box::new(BinaryHLLAccumulator::<i64>::new()),
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
-                    "Support for 'approx_distinct' for data type {} is not implemented",
-                    other
-                )))
+                "Support for 'approx_distinct' for data type {other} is not implemented"
+            )))
             }
         };
         Ok(accumulator)
@@ -219,7 +217,7 @@ macro_rules! default_accumulator_impl {
     () => {
         fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
             assert_eq!(1, states.len(), "expect only 1 element in the states");
-            let binary_array = states[0].as_any().downcast_ref::<BinaryArray>().unwrap();
+            let binary_array = downcast_value!(states[0], BinaryArray);
             for v in binary_array.iter() {
                 let v = v.ok_or_else(|| {
                     DataFusionError::Internal(
@@ -232,29 +230,20 @@ macro_rules! default_accumulator_impl {
             Ok(())
         }
 
-        fn state(&self) -> Result<Vec<AggregateState>> {
-            let value = AggregateState::Scalar(ScalarValue::from(&self.hll));
+        fn state(&self) -> Result<Vec<ScalarValue>> {
+            let value = ScalarValue::from(&self.hll);
             Ok(vec![value])
         }
 
         fn evaluate(&self) -> Result<ScalarValue> {
             Ok(ScalarValue::UInt64(Some(self.hll.count() as u64)))
         }
-    };
-}
 
-macro_rules! downcast_value {
-    ($Value: expr, $Type: ident, $T: tt) => {{
-        $Value[0]
-            .as_any()
-            .downcast_ref::<$Type<T>>()
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "could not cast value to {}",
-                    type_name::<$Type<T>>()
-                ))
-            })?
-    }};
+        fn size(&self) -> usize {
+            // HLL has static size
+            std::mem::size_of_val(self)
+        }
+    };
 }
 
 impl<T> Accumulator for BinaryHLLAccumulator<T>
@@ -263,7 +252,7 @@ where
 {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let array: &GenericBinaryArray<T> =
-            downcast_value!(values, GenericBinaryArray, T);
+            downcast_value!(values[0], GenericBinaryArray, T);
         // flatten because we would skip nulls
         self.hll
             .extend(array.into_iter().flatten().map(|v| v.to_vec()));
@@ -279,7 +268,7 @@ where
 {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let array: &GenericStringArray<T> =
-            downcast_value!(values, GenericStringArray, T);
+            downcast_value!(values[0], GenericStringArray, T);
         // flatten because we would skip nulls
         self.hll
             .extend(array.into_iter().flatten().map(|i| i.to_string()));
@@ -295,7 +284,7 @@ where
     T::Native: Hash,
 {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        let array: &PrimitiveArray<T> = downcast_value!(values, PrimitiveArray, T);
+        let array: &PrimitiveArray<T> = downcast_value!(values[0], PrimitiveArray, T);
         // flatten because we would skip nulls
         self.hll.extend(array.into_iter().flatten());
         Ok(())

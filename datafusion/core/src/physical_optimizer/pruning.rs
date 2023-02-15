@@ -29,24 +29,29 @@
 //! other source (e.g. a catalog)
 
 use std::convert::TryFrom;
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use crate::execution::context::ExecutionProps;
 use crate::prelude::lit;
 use crate::{
+    common::{Column, DFSchema},
     error::{DataFusionError, Result},
-    logical_plan::{Column, DFSchema, Expr, Operator},
+    logical_expr::{Expr, Operator},
     physical_plan::{ColumnarValue, PhysicalExpr},
 };
+use arrow::record_batch::RecordBatchOptions;
 use arrow::{
     array::{new_null_array, ArrayRef, BooleanArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use datafusion_expr::binary_expr;
-use datafusion_expr::expr_rewriter::{ExprRewritable, ExprRewriter};
-use datafusion_expr::utils::expr_to_columns;
+use datafusion_common::{downcast_value, ScalarValue};
+use datafusion_expr::expr::{BinaryExpr, Cast, TryCast};
+use datafusion_expr::expr_rewriter::rewrite_expr;
+use datafusion_expr::{binary_expr, cast, try_cast, ExprSchemable};
 use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr::expressions::Literal;
+use log::trace;
 
 /// Interface to pass statistics information to [`PruningPredicate`]
 ///
@@ -168,38 +173,40 @@ impl PruningPredicate {
     /// simplified version `b`. The predicates are simplified via the
     /// ConstantFolding optimizer pass
     pub fn prune<S: PruningStatistics>(&self, statistics: &S) -> Result<Vec<bool>> {
-        // build statistics record batch
-        let predicate_array =
-            build_statistics_record_batch(statistics, &self.required_columns)
-                .and_then(|statistics_batch| {
-                    // execute predicate expression
-                    self.predicate_expr.evaluate(&statistics_batch)
-                })
-                .and_then(|v| match v {
-                    ColumnarValue::Array(array) => Ok(array),
-                    ColumnarValue::Scalar(_) => Err(DataFusionError::Internal(
-                        "predicate expression didn't return an array".to_string(),
-                    )),
-                })?;
+        // build a RecordBatch that contains the min/max values in the
+        // appropriate statistics columns
+        let statistics_batch =
+            build_statistics_record_batch(statistics, &self.required_columns)?;
 
-        let predicate_array = predicate_array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "Expected pruning predicate evaluation to be BooleanArray, \
-                     but was {:?}",
-                    predicate_array
-                ))
-            })?;
+        // Evaluate the pruning predicate on that record batch.
+        //
+        // Use true when the result of evaluating a predicate
+        // expression on a row group is null (aka `None`). Null can
+        // arise when the statistics are unknown or some calculation
+        // in the predicate means we don't know for sure if the row
+        // group can be filtered out or not. To maintain correctness
+        // the row group must be kept and thus `true` is returned.
+        match self.predicate_expr.evaluate(&statistics_batch)? {
+            ColumnarValue::Array(array) => {
+                let predicate_array = downcast_value!(array, BooleanArray);
 
-        // when the result of the predicate expression for a row group is null / undefined,
-        // e.g. due to missing statistics, this row group can't be filtered out,
-        // so replace with true
-        Ok(predicate_array
-            .into_iter()
-            .map(|x| x.unwrap_or(true))
-            .collect::<Vec<_>>())
+                Ok(predicate_array
+                    .into_iter()
+                    .map(|x| x.unwrap_or(true)) // None -> true per comments above
+                    .collect::<Vec<_>>())
+            }
+            // result was a column
+            ColumnarValue::Scalar(ScalarValue::Boolean(v)) => {
+                let v = v.unwrap_or(true); // None -> true per comments above
+                Ok(vec![v; statistics.num_containers()])
+            }
+            other => {
+                Err(DataFusionError::Internal(format!(
+                    "Unexpected result of pruning predicate evaluation. Expected Boolean array \
+                     or scalar but got {other:?}"
+                )))
+            }
+        }
     }
 
     /// Return a reference to the input schema
@@ -216,12 +223,28 @@ impl PruningPredicate {
     pub fn predicate_expr(&self) -> &Arc<dyn PhysicalExpr> {
         &self.predicate_expr
     }
+
+    /// Returns true if this pruning predicate is "always true" (aka will not prune anything)
+    pub fn allways_true(&self) -> bool {
+        self.predicate_expr
+            .as_any()
+            .downcast_ref::<Literal>()
+            .map(|l| matches!(l.value(), ScalarValue::Boolean(Some(true))))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn required_columns(&self) -> &RequiredStatColumns {
+        &self.required_columns
+    }
 }
 
+/// Records for which columns statistics are necessary to evaluate a
+/// pruning predicate.
+///
 /// Handles creating references to the min/max statistics
 /// for columns as well as recording which statistics are needed
 #[derive(Debug, Default, Clone)]
-struct RequiredStatColumns {
+pub(crate) struct RequiredStatColumns {
     /// The statistics required to evaluate this predicate:
     /// * The unqualified column in the input schema
     /// * Statistics type (e.g. Min or Max or Null_Count)
@@ -237,7 +260,7 @@ impl RequiredStatColumns {
 
     /// Returns an iterator over items in columns (see doc on
     /// `self.columns` for details)
-    fn iter(&self) -> impl Iterator<Item = &(Column, StatisticsType, Field)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(Column, StatisticsType, Field)> {
         self.columns.iter()
     }
 
@@ -390,8 +413,19 @@ fn build_statistics_record_batch<S: PruningStatistics>(
     }
 
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, arrays)
-        .map_err(|err| DataFusionError::Plan(err.to_string()))
+    // provide the count in case there were no needed statistics
+    let mut options = RecordBatchOptions::default();
+    options.row_count = Some(statistics.num_containers());
+
+    trace!(
+        "Creating statistics batch for {:#?} with {:#?}",
+        required_columns,
+        arrays
+    );
+
+    RecordBatch::try_new_with_options(schema, arrays, &options).map_err(|err| {
+        DataFusionError::Plan(format!("Can not create statistics record batch: {err}"))
+    })
 }
 
 struct PruningExpressionBuilder<'a> {
@@ -412,14 +446,12 @@ impl<'a> PruningExpressionBuilder<'a> {
         required_columns: &'a mut RequiredStatColumns,
     ) -> Result<Self> {
         // find column name; input could be a more complicated expression
-        let mut left_columns = HashSet::<Column>::new();
-        expr_to_columns(left, &mut left_columns)?;
-        let mut right_columns = HashSet::<Column>::new();
-        expr_to_columns(right, &mut right_columns)?;
+        let left_columns = left.to_columns()?;
+        let right_columns = right.to_columns()?;
         let (column_expr, scalar_expr, columns, correct_operator) =
             match (left_columns.len(), right_columns.len()) {
                 (1, 0) => (left, right, left_columns, op),
-                (0, 1) => (right, left, right_columns, reverse_operator(op)),
+                (0, 1) => (right, left, right_columns, reverse_operator(op)?),
                 _ => {
                     // if more than one column used in expression - not supported
                     return Err(DataFusionError::Plan(
@@ -429,11 +461,13 @@ impl<'a> PruningExpressionBuilder<'a> {
                 }
             };
 
-        let (column_expr, correct_operator, scalar_expr) =
-            match rewrite_expr_to_prunable(column_expr, correct_operator, scalar_expr) {
-                Ok(ret) => ret,
-                Err(e) => return Err(e),
-            };
+        let df_schema = DFSchema::try_from(schema.clone())?;
+        let (column_expr, correct_operator, scalar_expr) = rewrite_expr_to_prunable(
+            column_expr,
+            correct_operator,
+            scalar_expr,
+            df_schema,
+        )?;
         let column = columns.iter().next().unwrap().clone();
         let field = match schema.column_with_name(&column.flat_name()) {
             Some((_, f)) => f,
@@ -481,12 +515,15 @@ impl<'a> PruningExpressionBuilder<'a> {
 /// 2. `-col > 10` should be rewritten to `col < -10`
 /// 3. `!col = true` would be rewritten to `col = !true`
 /// 4. `abs(a - 10) > 0` not supported
+/// 5. `cast(can_prunable_expr) > 10`
+/// 6. `try_cast(can_prunable_expr) > 10`
 ///
 /// More rewrite rules are still in progress.
 fn rewrite_expr_to_prunable(
     column_expr: &Expr,
     op: Operator,
     scalar_expr: &Expr,
+    schema: DFSchema,
 ) -> Result<(Expr, Operator, Expr)> {
     if !is_compare_op(op) {
         return Err(DataFusionError::Plan(
@@ -495,22 +532,29 @@ fn rewrite_expr_to_prunable(
     }
 
     match column_expr {
-        // `col > lit()`
+        // `col op lit()`
         Expr::Column(_) => Ok((column_expr.clone(), op, scalar_expr.clone())),
-
+        // `cast(col) op lit()`
+        Expr::Cast(Cast { expr, data_type }) => {
+            let from_type = expr.get_type(&schema)?;
+            verify_support_type_for_prune(&from_type, data_type)?;
+            let (left, op, right) =
+                rewrite_expr_to_prunable(expr, op, scalar_expr, schema)?;
+            Ok((cast(left, data_type.clone()), op, right))
+        }
+        // `try_cast(col) op lit()`
+        Expr::TryCast(TryCast { expr, data_type }) => {
+            let from_type = expr.get_type(&schema)?;
+            verify_support_type_for_prune(&from_type, data_type)?;
+            let (left, op, right) =
+                rewrite_expr_to_prunable(expr, op, scalar_expr, schema)?;
+            Ok((try_cast(left, data_type.clone()), op, right))
+        }
         // `-col > lit()`  --> `col < -lit()`
-        Expr::Negative(c) => match c.as_ref() {
-            Expr::Column(_) => Ok((
-                c.as_ref().clone(),
-                reverse_operator(op),
-                Expr::Negative(Box::new(scalar_expr.clone())),
-            )),
-            _ => Err(DataFusionError::Plan(format!(
-                "negative with complex expression {:?} is not supported",
-                column_expr
-            ))),
-        },
-
+        Expr::Negative(c) => {
+            let (left, op, right) = rewrite_expr_to_prunable(c, op, scalar_expr, schema)?;
+            Ok((left, reverse_operator(op)?, Expr::Negative(Box::new(right))))
+        }
         // `!col = true` --> `col = !true`
         Expr::Not(c) => {
             if op != Operator::Eq && op != Operator::NotEq {
@@ -522,19 +566,17 @@ fn rewrite_expr_to_prunable(
             return match c.as_ref() {
                 Expr::Column(_) => Ok((
                     c.as_ref().clone(),
-                    reverse_operator(op),
+                    reverse_operator(op)?,
                     Expr::Not(Box::new(scalar_expr.clone())),
                 )),
                 _ => Err(DataFusionError::Plan(format!(
-                    "Not with complex expression {:?} is not supported",
-                    column_expr
+                    "Not with complex expression {column_expr:?} is not supported"
                 ))),
             };
         }
 
         _ => Err(DataFusionError::Plan(format!(
-            "column expression {:?} is not supported",
-            column_expr
+            "column expression {column_expr:?} is not supported"
         ))),
     }
 }
@@ -551,40 +593,49 @@ fn is_compare_op(op: Operator) -> bool {
     )
 }
 
+// The pruning logic is based on the comparing the min/max bounds.
+// Must make sure the two type has order.
+// For example, casts from string to numbers is not correct.
+// Because the "13" is less than "3" with UTF8 comparison order.
+fn verify_support_type_for_prune(from_type: &DataType, to_type: &DataType) -> Result<()> {
+    // TODO: support other data type for prunable cast or try cast
+    if matches!(
+        from_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Decimal128(_, _)
+    ) && matches!(
+        to_type,
+        DataType::Int8 | DataType::Int32 | DataType::Int64 | DataType::Decimal128(_, _)
+    ) {
+        Ok(())
+    } else {
+        Err(DataFusionError::Plan(format!(
+            "Try Cast/Cast with from type {from_type} to type {to_type} is not supported"
+        )))
+    }
+}
+
 /// replaces a column with an old name with a new name in an expression
 fn rewrite_column_expr(
     e: Expr,
     column_old: &Column,
     column_new: &Column,
 ) -> Result<Expr> {
-    struct ColumnReplacer<'a> {
-        old: &'a Column,
-        new: &'a Column,
-    }
-
-    impl<'a> ExprRewriter for ColumnReplacer<'a> {
-        fn mutate(&mut self, expr: Expr) -> Result<Expr> {
-            match expr {
-                Expr::Column(c) if c == *self.old => Ok(Expr::Column(self.new.clone())),
-                _ => Ok(expr),
-            }
-        }
-    }
-
-    e.rewrite(&mut ColumnReplacer {
-        old: column_old,
-        new: column_new,
+    rewrite_expr(e, |expr| match expr {
+        Expr::Column(c) if c == *column_old => Ok(Expr::Column(column_new.clone())),
+        _ => Ok(expr),
     })
 }
 
-fn reverse_operator(op: Operator) -> Operator {
-    match op {
-        Operator::Lt => Operator::Gt,
-        Operator::Gt => Operator::Lt,
-        Operator::LtEq => Operator::GtEq,
-        Operator::GtEq => Operator::LtEq,
-        _ => op,
-    }
+fn reverse_operator(op: Operator) -> Result<Operator> {
+    op.swap().ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "Could not reverse operator {op} while building pruning predicate"
+        ))
+    })
 }
 
 /// Given a column reference to `column`, returns a pruning
@@ -662,16 +713,13 @@ fn build_predicate_expression(
     schema: &Schema,
     required_columns: &mut RequiredStatColumns,
 ) -> Result<Expr> {
-    use crate::logical_plan;
-
     // Returned for unsupported expressions. Such expressions are
-    // converted to TRUE. This can still be useful when multiple
-    // conditions are joined using AND such as: column > 10 AND TRUE
-    let unhandled = logical_plan::lit(true);
+    // converted to TRUE.
+    let unhandled = lit(true);
 
     // predicate expression can only be a binary expression
     let (left, op, right) = match expr {
-        Expr::BinaryExpr { left, op, right } => (left, *op, right),
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => (left, *op, right),
         Expr::IsNull(expr) => {
             let expr = build_is_null_column_expr(expr, schema, required_columns)
                 .unwrap_or(unhandled);
@@ -714,7 +762,16 @@ fn build_predicate_expression(
     if op == Operator::And || op == Operator::Or {
         let left_expr = build_predicate_expression(left, schema, required_columns)?;
         let right_expr = build_predicate_expression(right, schema, required_columns)?;
-        return Ok(binary_expr(left_expr, op, right_expr));
+        // simplify boolean expression if applicable
+        let expr = match (&left_expr, op, &right_expr) {
+            (left, Operator::And, _) if *left == unhandled => right_expr,
+            (_, Operator::And, right) if *right == unhandled => left_expr,
+            (left, Operator::Or, right) if *left == unhandled || *right == unhandled => {
+                unhandled
+            }
+            _ => binary_expr(left_expr, op, right_expr),
+        };
+        return Ok(expr);
     }
 
     let expr_builder =
@@ -788,7 +845,7 @@ fn build_statistics_expr(expr_builder: &mut PruningExpressionBuilder) -> Result<
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum StatisticsType {
+pub(crate) enum StatisticsType {
     Min,
     Max,
     NullCount,
@@ -798,18 +855,18 @@ enum StatisticsType {
 mod tests {
     use super::*;
     use crate::from_slice::FromSlice;
-    use crate::logical_plan::{col, lit};
+    use crate::logical_expr::{col, lit};
     use crate::{assert_batches_eq, physical_optimizer::pruning::StatisticsType};
-    use arrow::array::{BasicDecimalArray, Decimal128Array};
+    use arrow::array::Decimal128Array;
     use arrow::{
         array::{BinaryArray, Int32Array, Int64Array, StringArray},
         datatypes::{DataType, TimeUnit},
     };
     use datafusion_common::ScalarValue;
+    use datafusion_expr::{cast, is_null};
     use std::collections::HashMap;
 
     #[derive(Debug)]
-
     /// Mock statistic provider for tests
     ///
     /// Each row represents the statistics for a "container" (which
@@ -828,8 +885,8 @@ mod tests {
         fn new_decimal128(
             min: impl IntoIterator<Item = Option<i128>>,
             max: impl IntoIterator<Item = Option<i128>>,
-            precision: usize,
-            scale: usize,
+            precision: u8,
+            scale: i8,
         ) -> Self {
             Self {
                 min: Arc::new(
@@ -1123,7 +1180,7 @@ mod tests {
             "+-------------------------------+",
             "| s1_min                        |",
             "+-------------------------------+",
-            "| 1970-01-01 00:00:00.000000010 |",
+            "| 1970-01-01T00:00:00.000000010 |",
             "+-------------------------------+",
         ];
 
@@ -1131,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_statistics_no_stats() {
+    fn test_build_statistics_no_required_stats() {
         let required_columns = RequiredStatColumns::new();
 
         let statistics = OneContainerStats {
@@ -1140,13 +1197,9 @@ mod tests {
             num_containers: 1,
         };
 
-        let result =
-            build_statistics_record_batch(&statistics, &required_columns).unwrap_err();
-        assert!(
-            result.to_string().contains("Invalid argument error"),
-            "{}",
-            result
-        );
+        let batch =
+            build_statistics_record_batch(&statistics, &required_columns).unwrap();
+        assert_eq!(batch.num_rows(), 1); // had 1 container
     }
 
     #[test]
@@ -1162,7 +1215,7 @@ mod tests {
 
         // Note the statistics return binary (which can't be cast to string)
         let statistics = OneContainerStats {
-            min_values: Some(Arc::new(BinaryArray::from_slice(&[&[255u8] as &[u8]]))),
+            min_values: Some(Arc::new(BinaryArray::from_slice([&[255u8] as &[u8]]))),
             max_values: None,
             num_containers: 1,
         };
@@ -1210,19 +1263,19 @@ mod tests {
     #[test]
     fn row_group_predicate_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "#c1_min <= Int32(1) AND Int32(1) <= #c1_max";
+        let expected_expr = "c1_min <= Int32(1) AND Int32(1) <= c1_max";
 
         // test column on the left
         let expr = col("c1").eq(lit(1));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         // test column on the right
         let expr = lit(1).eq(col("c1"));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1230,19 +1283,19 @@ mod tests {
     #[test]
     fn row_group_predicate_not_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "#c1_min != Int32(1) OR Int32(1) != #c1_max";
+        let expected_expr = "c1_min != Int32(1) OR Int32(1) != c1_max";
 
         // test column on the left
         let expr = col("c1").not_eq(lit(1));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         // test column on the right
         let expr = lit(1).not_eq(col("c1"));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1250,19 +1303,19 @@ mod tests {
     #[test]
     fn row_group_predicate_gt() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "#c1_max > Int32(1)";
+        let expected_expr = "c1_max > Int32(1)";
 
         // test column on the left
         let expr = col("c1").gt(lit(1));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         // test column on the right
         let expr = lit(1).lt(col("c1"));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1270,18 +1323,18 @@ mod tests {
     #[test]
     fn row_group_predicate_gt_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "#c1_max >= Int32(1)";
+        let expected_expr = "c1_max >= Int32(1)";
 
         // test column on the left
         let expr = col("c1").gt_eq(lit(1));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
         // test column on the right
         let expr = lit(1).lt_eq(col("c1"));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1289,19 +1342,19 @@ mod tests {
     #[test]
     fn row_group_predicate_lt() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "#c1_min < Int32(1)";
+        let expected_expr = "c1_min < Int32(1)";
 
         // test column on the left
         let expr = col("c1").lt(lit(1));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         // test column on the right
         let expr = lit(1).gt(col("c1"));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1309,18 +1362,18 @@ mod tests {
     #[test]
     fn row_group_predicate_lt_eq() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
-        let expected_expr = "#c1_min <= Int32(1)";
+        let expected_expr = "c1_min <= Int32(1)";
 
         // test column on the left
         let expr = col("c1").lt_eq(lit(1));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
         // test column on the right
         let expr = lit(1).gt_eq(col("c1"));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1334,10 +1387,10 @@ mod tests {
         ]);
         // test AND operator joining supported c1 < 1 expression and unsupported c2 > c3 expression
         let expr = col("c1").lt(lit(1)).and(col("c2").lt(col("c3")));
-        let expected_expr = "#c1_min < Int32(1) AND Boolean(true)";
+        let expected_expr = "c1_min < Int32(1)";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1350,10 +1403,10 @@ mod tests {
         ]);
         // test OR operator joining supported c1 < 1 expression and unsupported c2 % 2 expression
         let expr = col("c1").lt(lit(1)).or(col("c2").modulus(lit(2)));
-        let expected_expr = "#c1_min < Int32(1) OR Boolean(true)";
+        let expected_expr = "Boolean(true)";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1366,7 +1419,7 @@ mod tests {
         let expr = col("c1").not();
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1374,12 +1427,12 @@ mod tests {
     #[test]
     fn row_group_predicate_not_bool() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Boolean, false)]);
-        let expected_expr = "NOT #c1_min AND #c1_max";
+        let expected_expr = "NOT c1_min AND c1_max";
 
         let expr = col("c1").not();
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1387,12 +1440,12 @@ mod tests {
     #[test]
     fn row_group_predicate_bool() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Boolean, false)]);
-        let expected_expr = "#c1_min OR #c1_max";
+        let expected_expr = "c1_min OR c1_max";
 
         let expr = col("c1");
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1400,14 +1453,14 @@ mod tests {
     #[test]
     fn row_group_predicate_lt_bool() -> Result<()> {
         let schema = Schema::new(vec![Field::new("c1", DataType::Boolean, false)]);
-        let expected_expr = "#c1_min < Boolean(true)";
+        let expected_expr = "c1_min < Boolean(true)";
 
         // DF doesn't support arithmetic on boolean columns so
         // this predicate will error when evaluated
         let expr = col("c1").lt(lit(true));
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1423,10 +1476,10 @@ mod tests {
         let expr = col("c1")
             .lt(lit(1))
             .and(col("c2").eq(lit(2)).or(col("c2").eq(lit(3))));
-        let expected_expr = "#c1_min < Int32(1) AND #c2_min <= Int32(2) AND Int32(2) <= #c2_max OR #c2_min <= Int32(3) AND Int32(3) <= #c2_max";
+        let expected_expr = "c1_min < Int32(1) AND (c2_min <= Int32(2) AND Int32(2) <= c2_max OR c2_min <= Int32(3) AND Int32(3) <= c2_max)";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut required_columns)?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
         // c1 < 1 should add c1_min
         let c1_min_field = Field::new("c1_min", DataType::Int32, false);
         assert_eq!(
@@ -1462,10 +1515,10 @@ mod tests {
             list: vec![lit(1), lit(2), lit(3)],
             negated: false,
         };
-        let expected_expr = "#c1_min <= Int32(1) AND Int32(1) <= #c1_max OR #c1_min <= Int32(2) AND Int32(2) <= #c1_max OR #c1_min <= Int32(3) AND Int32(3) <= #c1_max";
+        let expected_expr = "c1_min <= Int32(1) AND Int32(1) <= c1_max OR c1_min <= Int32(2) AND Int32(2) <= c1_max OR c1_min <= Int32(3) AND Int32(3) <= c1_max";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1485,7 +1538,7 @@ mod tests {
         let expected_expr = "Boolean(true)";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1502,10 +1555,87 @@ mod tests {
             list: vec![lit(1), lit(2), lit(3)],
             negated: true,
         };
-        let expected_expr = "#c1_min != Int32(1) OR Int32(1) != #c1_max AND #c1_min != Int32(2) OR Int32(2) != #c1_max AND #c1_min != Int32(3) OR Int32(3) != #c1_max";
+        let expected_expr = "(c1_min != Int32(1) OR Int32(1) != c1_max) \
+        AND (c1_min != Int32(2) OR Int32(2) != c1_max) \
+        AND (c1_min != Int32(3) OR Int32(3) != c1_max)";
         let predicate_expr =
             build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
-        assert_eq!(format!("{:?}", predicate_expr), expected_expr);
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
+
+        Ok(())
+    }
+
+    #[test]
+    fn row_group_predicate_cast() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
+        let expected_expr =
+            "CAST(c1_min AS Int64) <= Int64(1) AND Int64(1) <= CAST(c1_max AS Int64)";
+
+        // test column on the left
+        let expr = cast(col("c1"), DataType::Int64).eq(lit(ScalarValue::Int64(Some(1))));
+        let predicate_expr =
+            build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
+
+        // test column on the right
+        let expr = lit(ScalarValue::Int64(Some(1))).eq(cast(col("c1"), DataType::Int64));
+        let predicate_expr =
+            build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
+
+        let expected_expr = "TRY_CAST(c1_max AS Int64) > Int64(1)";
+
+        // test column on the left
+        let expr =
+            try_cast(col("c1"), DataType::Int64).gt(lit(ScalarValue::Int64(Some(1))));
+        let predicate_expr =
+            build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
+
+        // test column on the right
+        let expr =
+            lit(ScalarValue::Int64(Some(1))).lt(try_cast(col("c1"), DataType::Int64));
+        let predicate_expr =
+            build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
+
+        Ok(())
+    }
+
+    #[test]
+    fn row_group_predicate_cast_list() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
+        // test cast(c1 as int64) in int64(1, 2, 3)
+        let expr = Expr::InList {
+            expr: Box::new(cast(col("c1"), DataType::Int64)),
+            list: vec![
+                lit(ScalarValue::Int64(Some(1))),
+                lit(ScalarValue::Int64(Some(2))),
+                lit(ScalarValue::Int64(Some(3))),
+            ],
+            negated: false,
+        };
+        let expected_expr = "CAST(c1_min AS Int64) <= Int64(1) AND Int64(1) <= CAST(c1_max AS Int64) OR CAST(c1_min AS Int64) <= Int64(2) AND Int64(2) <= CAST(c1_max AS Int64) OR CAST(c1_min AS Int64) <= Int64(3) AND Int64(3) <= CAST(c1_max AS Int64)";
+        let predicate_expr =
+            build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
+
+        let expr = Expr::InList {
+            expr: Box::new(cast(col("c1"), DataType::Int64)),
+            list: vec![
+                lit(ScalarValue::Int64(Some(1))),
+                lit(ScalarValue::Int64(Some(2))),
+                lit(ScalarValue::Int64(Some(3))),
+            ],
+            negated: true,
+        };
+        let expected_expr =
+            "(CAST(c1_min AS Int64) != Int64(1) OR Int64(1) != CAST(c1_max AS Int64)) \
+        AND (CAST(c1_min AS Int64) != Int64(2) OR Int64(2) != CAST(c1_max AS Int64)) \
+        AND (CAST(c1_min AS Int64) != Int64(3) OR Int64(3) != CAST(c1_max AS Int64))";
+        let predicate_expr =
+            build_predicate_expression(&expr, &schema, &mut RequiredStatColumns::new())?;
+        assert_eq!(format!("{predicate_expr:?}"), expected_expr);
 
         Ok(())
     }
@@ -1522,6 +1652,36 @@ mod tests {
         let expr = col("s1").gt(lit(ScalarValue::Decimal128(Some(500), 9, 2)));
         // If the data is written by spark, the physical data type is INT32 in the parquet
         // So we use the INT32 type of statistic.
+        let statistics = TestStatistics::new().with(
+            "s1",
+            ContainerStats::new_i32(
+                vec![Some(0), Some(4), None, Some(3)], // min
+                vec![Some(5), Some(6), Some(4), None], // max
+            ),
+        );
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        let expected = vec![false, true, false, true];
+        assert_eq!(result, expected);
+
+        // with cast column to other type
+        let expr = cast(col("s1"), DataType::Decimal128(14, 3))
+            .gt(lit(ScalarValue::Decimal128(Some(5000), 14, 3)));
+        let statistics = TestStatistics::new().with(
+            "s1",
+            ContainerStats::new_i32(
+                vec![Some(0), Some(4), None, Some(3)], // min
+                vec![Some(5), Some(6), Some(4), None], // max
+            ),
+        );
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        let expected = vec![false, true, false, true];
+        assert_eq!(result, expected);
+
+        // with try cast column to other type
+        let expr = try_cast(col("s1"), DataType::Decimal128(14, 3))
+            .gt(lit(ScalarValue::Decimal128(Some(5000), 14, 3)));
         let statistics = TestStatistics::new().with(
             "s1",
             ContainerStats::new_i32(
@@ -1578,6 +1738,7 @@ mod tests {
         let expected = vec![false, true, false, true];
         assert_eq!(result, expected);
     }
+
     #[test]
     fn prune_api() {
         let schema = Arc::new(Schema::new(vec![
@@ -1601,10 +1762,16 @@ mod tests {
         // No stats for s2 ==> some rows could pass
         // s2 [3, None] (null max) ==> some rows could pass
 
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        let expected = vec![false, true, true, true];
+        assert_eq!(result, expected);
+
+        // filter with cast
+        let expr = cast(col("s2"), DataType::Int64).gt(lit(ScalarValue::Int64(Some(5))));
         let p = PruningPredicate::try_new(expr, schema).unwrap();
         let result = p.prune(&statistics).unwrap();
         let expected = vec![false, true, true, true];
-
         assert_eq!(result, expected);
     }
 
@@ -1712,7 +1879,15 @@ mod tests {
         assert_eq!(result, expected_false);
     }
 
-    /// Creates setup for int32 chunk pruning
+    /// Creates a setup for chunk pruning, modeling a int32 column "i"
+    /// with 5 different containers (e.g. RowGroups). They have [min,
+    /// max]:
+    ///
+    /// i [-5, 5]
+    /// i [1, 11]
+    /// i [-11, -1]
+    /// i [NULL, NULL]
+    /// i [1, NULL]
     fn int32_setup() -> (SchemaRef, TestStatistics) {
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)]));
 
@@ -1777,6 +1952,45 @@ mod tests {
     }
 
     #[test]
+    fn prune_int32_col_lte_zero_cast() {
+        let (schema, statistics) = int32_setup();
+
+        // Expression "cast(i as utf8) <= '0'"
+        // i [-5, 5] ==> some rows could pass (must keep)
+        // i [1, 11] ==> no rows can pass in theory, -0.22 (conservatively keep)
+        // i [-11, -1] ==>  no rows could pass in theory (conservatively keep)
+        // i [NULL, NULL]  ==> unknown (must keep)
+        // i [1, NULL]  ==> no rows can pass (conservatively keep)
+        let expected_ret = vec![true, true, true, true, true];
+
+        // cast(i as utf8) <= 0
+        let expr = cast(col("i"), DataType::Utf8).lt_eq(lit("0"));
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+
+        // try_cast(i as utf8) <= 0
+        let expr = try_cast(col("i"), DataType::Utf8).lt_eq(lit("0"));
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+
+        // cast(-i as utf8) >= 0
+        let expr =
+            Expr::Negative(Box::new(cast(col("i"), DataType::Utf8))).gt_eq(lit("0"));
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+
+        // try_cast(-i as utf8) >= 0
+        let expr =
+            Expr::Negative(Box::new(try_cast(col("i"), DataType::Utf8))).gt_eq(lit("0"));
+        let p = PruningPredicate::try_new(expr, schema).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+    }
+
+    #[test]
     fn prune_int32_col_eq_zero() {
         let (schema, statistics) = int32_setup();
 
@@ -1790,6 +2004,50 @@ mod tests {
 
         // i = 0
         let expr = col("i").eq(lit(0));
+        let p = PruningPredicate::try_new(expr, schema).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+    }
+
+    #[test]
+    fn prune_int32_col_eq_zero_cast() {
+        let (schema, statistics) = int32_setup();
+
+        // Expression "cast(i as int64) = 0"
+        // i [-5, 5] ==> some rows could pass (must keep)
+        // i [1, 11] ==> no rows can pass (not keep)
+        // i [-11, -1] ==>  no rows can pass (not keep)
+        // i [NULL, NULL]  ==> unknown (must keep)
+        // i [1, NULL]  ==> no rows can pass (not keep)
+        let expected_ret = vec![true, false, false, true, false];
+
+        let expr = cast(col("i"), DataType::Int64).eq(lit(0i64));
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+
+        let expr = try_cast(col("i"), DataType::Int64).eq(lit(0i64));
+        let p = PruningPredicate::try_new(expr, schema).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+    }
+
+    #[test]
+    fn prune_int32_col_eq_zero_cast_as_str() {
+        let (schema, statistics) = int32_setup();
+
+        // Note the cast is to a string where sorting properties are
+        // not the same as integers
+        //
+        // Expression "cast(i as utf8) = '0'"
+        // i [-5, 5] ==> some rows could pass (keep)
+        // i [1, 11] ==> no rows can pass  (could keep)
+        // i [-11, -1] ==>  no rows can pass (could keep)
+        // i [NULL, NULL]  ==> unknown (keep)
+        // i [1, NULL]  ==> no rows can pass (could keep)
+        let expected_ret = vec![true, true, true, true, true];
+
+        let expr = cast(col("i"), DataType::Utf8).eq(lit("0"));
         let p = PruningPredicate::try_new(expr, schema).unwrap();
         let result = p.prune(&statistics).unwrap();
         assert_eq!(result, expected_ret);
@@ -1853,5 +2111,101 @@ mod tests {
         let p = PruningPredicate::try_new(expr, schema).unwrap();
         let result = p.prune(&statistics).unwrap();
         assert_eq!(result, expected_ret);
+    }
+
+    #[test]
+    fn prune_cast_column_scalar() {
+        // The data type of column i is INT32
+        let (schema, statistics) = int32_setup();
+        let expected_ret = vec![true, true, false, true, true];
+
+        // i > int64(0)
+        let expr = col("i").gt(cast(lit(ScalarValue::Int64(Some(0))), DataType::Int32));
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+
+        // cast(i as int64) > int64(0)
+        let expr = cast(col("i"), DataType::Int64).gt(lit(ScalarValue::Int64(Some(0))));
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+
+        // try_cast(i as int64) > int64(0)
+        let expr =
+            try_cast(col("i"), DataType::Int64).gt(lit(ScalarValue::Int64(Some(0))));
+        let p = PruningPredicate::try_new(expr, schema.clone()).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+
+        // `-cast(i as int64) < 0` convert to `cast(i as int64) > -0`
+        let expr = Expr::Negative(Box::new(cast(col("i"), DataType::Int64)))
+            .lt(lit(ScalarValue::Int64(Some(0))));
+        let p = PruningPredicate::try_new(expr, schema).unwrap();
+        let result = p.prune(&statistics).unwrap();
+        assert_eq!(result, expected_ret);
+    }
+
+    #[test]
+    fn test_rewrite_expr_to_prunable() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let df_schema = DFSchema::try_from(schema).unwrap();
+        // column op lit
+        let left_input = col("a");
+        let right_input = lit(ScalarValue::Int32(Some(12)));
+        let (result_left, _, result_right) = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Eq,
+            &right_input,
+            df_schema.clone(),
+        )
+        .unwrap();
+        assert_eq!(result_left, left_input);
+        assert_eq!(result_right, right_input);
+        // cast op lit
+        let left_input = cast(col("a"), DataType::Decimal128(20, 3));
+        let right_input = lit(ScalarValue::Decimal128(Some(12), 20, 3));
+        let (result_left, _, result_right) = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Gt,
+            &right_input,
+            df_schema.clone(),
+        )
+        .unwrap();
+        assert_eq!(result_left, left_input);
+        assert_eq!(result_right, right_input);
+        // try_cast op lit
+        let left_input = try_cast(col("a"), DataType::Int64);
+        let right_input = lit(ScalarValue::Int64(Some(12)));
+        let (result_left, _, result_right) =
+            rewrite_expr_to_prunable(&left_input, Operator::Gt, &right_input, df_schema)
+                .unwrap();
+        assert_eq!(result_left, left_input);
+        assert_eq!(result_right, right_input);
+        // TODO: add test for other case and op
+    }
+
+    #[test]
+    fn test_rewrite_expr_to_prunable_error() {
+        // cast string value to numeric value
+        // this cast is not supported
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let df_schema = DFSchema::try_from(schema).unwrap();
+        let left_input = cast(col("a"), DataType::Int64);
+        let right_input = lit(ScalarValue::Int64(Some(12)));
+        let result = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Gt,
+            &right_input,
+            df_schema.clone(),
+        );
+        assert!(result.is_err());
+        // other expr
+        let left_input = is_null(col("a"));
+        let right_input = lit(ScalarValue::Int64(Some(12)));
+        let result =
+            rewrite_expr_to_prunable(&left_input, Operator::Gt, &right_input, df_schema);
+        assert!(result.is_err());
+        // TODO: add other negative test for other case and op
     }
 }

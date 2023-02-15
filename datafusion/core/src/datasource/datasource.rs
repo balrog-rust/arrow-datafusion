@@ -21,12 +21,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion_common::Statistics;
+use datafusion_expr::{CreateExternalTable, LogicalPlan};
 pub use datafusion_expr::{TableProviderFilterPushDown, TableType};
 
 use crate::arrow::datatypes::SchemaRef;
 use crate::error::Result;
 use crate::execution::context::SessionState;
-use crate::logical_plan::Expr;
+use crate::logical_expr::Expr;
 use crate::physical_plan::ExecutionPlan;
 
 /// Source table
@@ -47,14 +49,19 @@ pub trait TableProvider: Sync + Send {
         None
     }
 
+    /// Get the Logical Plan of this table, if available.
+    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+        None
+    }
+
     /// Create an ExecutionPlan that will scan the table.
     /// The table provider will be usually responsible of grouping
     /// the source data into partitions that can be efficiently
     /// parallelized or distributed.
     async fn scan(
         &self,
-        ctx: &SessionState,
-        projection: &Option<Vec<usize>>,
+        state: &SessionState,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         // limit can be used to reduce the amount scanned
         // from the datasource as a performance optimization.
@@ -71,4 +78,23 @@ pub trait TableProvider: Sync + Send {
     ) -> Result<TableProviderFilterPushDown> {
         Ok(TableProviderFilterPushDown::Unsupported)
     }
+
+    /// Get statistics for this table, if available
+    fn statistics(&self) -> Option<Statistics> {
+        None
+    }
+}
+
+/// A factory which creates [`TableProvider`]s at runtime given a URL.
+///
+/// For example, this can be used to create a table "on the fly"
+/// from a directory of files only when that name is referenced.
+#[async_trait]
+pub trait TableProviderFactory: Sync + Send {
+    /// Create a TableProvider with the given url
+    async fn create(
+        &self,
+        state: &SessionState,
+        cmd: &CreateExternalTable,
+    ) -> Result<Arc<dyn TableProvider>>;
 }

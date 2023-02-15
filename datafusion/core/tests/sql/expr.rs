@@ -29,14 +29,14 @@ async fn case_when() -> Result<()> {
         FROM t1";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+--------------------------------------------------------------------------------------+",
-        "| CASE WHEN #t1.c1 = Utf8(\"a\") THEN Int64(1) WHEN #t1.c1 = Utf8(\"b\") THEN Int64(2) END |",
-        "+--------------------------------------------------------------------------------------+",
-        "| 1                                                                                    |",
-        "| 2                                                                                    |",
-        "|                                                                                      |",
-        "|                                                                                      |",
-        "+--------------------------------------------------------------------------------------+",
+        "+------------------------------------------------------------------------------------+",
+        "| CASE WHEN t1.c1 = Utf8(\"a\") THEN Int64(1) WHEN t1.c1 = Utf8(\"b\") THEN Int64(2) END |",
+        "+------------------------------------------------------------------------------------+",
+        "| 1                                                                                  |",
+        "| 2                                                                                  |",
+        "|                                                                                    |",
+        "|                                                                                    |",
+        "+------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -52,14 +52,14 @@ async fn case_when_else() -> Result<()> {
         FROM t1";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+------------------------------------------------------------------------------------------------------+",
-        "| CASE WHEN #t1.c1 = Utf8(\"a\") THEN Int64(1) WHEN #t1.c1 = Utf8(\"b\") THEN Int64(2) ELSE Int64(999) END |",
-        "+------------------------------------------------------------------------------------------------------+",
-        "| 1                                                                                                    |",
-        "| 2                                                                                                    |",
-        "| 999                                                                                                  |",
-        "| 999                                                                                                  |",
-        "+------------------------------------------------------------------------------------------------------+",
+        "+----------------------------------------------------------------------------------------------------+",
+        "| CASE WHEN t1.c1 = Utf8(\"a\") THEN Int64(1) WHEN t1.c1 = Utf8(\"b\") THEN Int64(2) ELSE Int64(999) END |",
+        "+----------------------------------------------------------------------------------------------------+",
+        "| 1                                                                                                  |",
+        "| 2                                                                                                  |",
+        "| 999                                                                                                |",
+        "| 999                                                                                                |",
+        "+----------------------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -75,14 +75,14 @@ async fn case_when_with_base_expr() -> Result<()> {
         FROM t1";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+---------------------------------------------------------------------------+",
-        "| CASE #t1.c1 WHEN Utf8(\"a\") THEN Int64(1) WHEN Utf8(\"b\") THEN Int64(2) END |",
-        "+---------------------------------------------------------------------------+",
-        "| 1                                                                         |",
-        "| 2                                                                         |",
-        "|                                                                           |",
-        "|                                                                           |",
-        "+---------------------------------------------------------------------------+",
+        "+--------------------------------------------------------------------------+",
+        "| CASE t1.c1 WHEN Utf8(\"a\") THEN Int64(1) WHEN Utf8(\"b\") THEN Int64(2) END |",
+        "+--------------------------------------------------------------------------+",
+        "| 1                                                                        |",
+        "| 2                                                                        |",
+        "|                                                                          |",
+        "|                                                                          |",
+        "+--------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -98,14 +98,14 @@ async fn case_when_else_with_base_expr() -> Result<()> {
         FROM t1";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+-------------------------------------------------------------------------------------------+",
-        "| CASE #t1.c1 WHEN Utf8(\"a\") THEN Int64(1) WHEN Utf8(\"b\") THEN Int64(2) ELSE Int64(999) END |",
-        "+-------------------------------------------------------------------------------------------+",
-        "| 1                                                                                         |",
-        "| 2                                                                                         |",
-        "| 999                                                                                       |",
-        "| 999                                                                                       |",
-        "+-------------------------------------------------------------------------------------------+",
+        "+------------------------------------------------------------------------------------------+",
+        "| CASE t1.c1 WHEN Utf8(\"a\") THEN Int64(1) WHEN Utf8(\"b\") THEN Int64(2) ELSE Int64(999) END |",
+        "+------------------------------------------------------------------------------------------+",
+        "| 1                                                                                        |",
+        "| 2                                                                                        |",
+        "| 999                                                                                      |",
+        "| 999                                                                                      |",
+        "+------------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -121,14 +121,14 @@ async fn case_when_else_with_null_contant() -> Result<()> {
         FROM t1";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+----------------------------------------------------------------------------------------+",
-        "| CASE WHEN #t1.c1 = Utf8(\"a\") THEN Int64(1) WHEN NULL THEN Int64(2) ELSE Int64(999) END |",
-        "+----------------------------------------------------------------------------------------+",
-        "| 1                                                                                      |",
-        "| 999                                                                                    |",
-        "| 999                                                                                    |",
-        "| 999                                                                                    |",
-        "+----------------------------------------------------------------------------------------+",
+        "+---------------------------------------------------------------------------------------+",
+        "| CASE WHEN t1.c1 = Utf8(\"a\") THEN Int64(1) WHEN NULL THEN Int64(2) ELSE Int64(999) END |",
+        "+---------------------------------------------------------------------------------------+",
+        "| 1                                                                                     |",
+        "| 999                                                                                   |",
+        "| 999                                                                                   |",
+        "| 999                                                                                   |",
+        "+---------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
 
@@ -152,12 +152,12 @@ async fn case_expr_with_null() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
 
     let expected = vec![
-        "+------------------------------------------------+",
-        "| CASE WHEN #a.b IS NULL THEN NULL ELSE #a.b END |",
-        "+------------------------------------------------+",
-        "|                                                |",
-        "| 3                                              |",
-        "+------------------------------------------------+",
+        "+----------------------------------------------+",
+        "| CASE WHEN a.b IS NULL THEN NULL ELSE a.b END |",
+        "+----------------------------------------------+",
+        "|                                              |",
+        "| 3                                            |",
+        "+----------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
 
@@ -165,12 +165,12 @@ async fn case_expr_with_null() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
 
     let expected = vec![
-        "+------------------------------------------------+",
-        "| CASE WHEN #a.b IS NULL THEN NULL ELSE #a.b END |",
-        "+------------------------------------------------+",
-        "| 1                                              |",
-        "| 3                                              |",
-        "+------------------------------------------------+",
+        "+----------------------------------------------+",
+        "| CASE WHEN a.b IS NULL THEN NULL ELSE a.b END |",
+        "+----------------------------------------------+",
+        "| 1                                            |",
+        "| 3                                            |",
+        "+----------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
 
@@ -184,13 +184,13 @@ async fn case_expr_with_nulls() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
 
     let expected = vec![
-        "+--------------------------------------------------------------------------------------------------------------------------+",
-        "| CASE WHEN #a.b IS NULL THEN NULL WHEN #a.b < Int64(3) THEN NULL WHEN #a.b >= Int64(3) THEN #a.b + Int64(1) ELSE #a.b END |",
-        "+--------------------------------------------------------------------------------------------------------------------------+",
-        "|                                                                                                                          |",
-        "|                                                                                                                          |",
-        "| 4                                                                                                                        |",
-        "+--------------------------------------------------------------------------------------------------------------------------+"
+        "+---------------------------------------------------------------------------------------------------------------------+",
+        "| CASE WHEN a.b IS NULL THEN NULL WHEN a.b < Int64(3) THEN NULL WHEN a.b >= Int64(3) THEN a.b + Int64(1) ELSE a.b END |",
+        "+---------------------------------------------------------------------------------------------------------------------+",
+        "|                                                                                                                     |",
+        "|                                                                                                                     |",
+        "| 4                                                                                                                   |",
+        "+---------------------------------------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
 
@@ -198,13 +198,13 @@ async fn case_expr_with_nulls() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
 
     let expected = vec![
-        "+------------------------------------------------------------------------------------------------------------+",
-        "| CASE #a.b WHEN Int64(1) THEN NULL WHEN Int64(2) THEN NULL WHEN Int64(3) THEN #a.b + Int64(1) ELSE #a.b END |",
-        "+------------------------------------------------------------------------------------------------------------+",
-        "|                                                                                                            |",
-        "|                                                                                                            |",
-        "| 4                                                                                                          |",
-        "+------------------------------------------------------------------------------------------------------------+",
+        "+---------------------------------------------------------------------------------------------------------+",
+        "| CASE a.b WHEN Int64(1) THEN NULL WHEN Int64(2) THEN NULL WHEN Int64(3) THEN a.b + Int64(1) ELSE a.b END |",
+        "+---------------------------------------------------------------------------------------------------------+",
+        "|                                                                                                         |",
+        "|                                                                                                         |",
+        "| 4                                                                                                       |",
+        "+---------------------------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
 
@@ -224,10 +224,8 @@ async fn query_not() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT NOT c1 FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
@@ -247,8 +245,8 @@ async fn query_not() -> Result<()> {
 async fn csv_query_sum_cast() {
     let ctx = SessionContext::new();
     register_aggregate_csv_by_sql(&ctx).await;
-    // c8 = i32; c9 = i64
-    let sql = "SELECT c8 + c9 FROM aggregate_test_100";
+    // c8 = i32; c6 = i64
+    let sql = "SELECT c8 + c6 FROM aggregate_test_100";
     // check that the physical and logical schemas are equal
     execute(&ctx, sql).await;
 }
@@ -266,10 +264,8 @@ async fn query_is_null() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT c1 IS NULL FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
@@ -298,10 +294,8 @@ async fn query_is_not_null() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT c1 IS NOT NULL FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
@@ -312,6 +306,186 @@ async fn query_is_not_null() -> Result<()> {
         "| false               |",
         "| true                |",
         "+---------------------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_is_true() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Boolean, true)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", data)?;
+    let sql = "SELECT c1 IS TRUE as t FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| t     |",
+        "+-------+",
+        "| true  |",
+        "| false |",
+        "| false |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_is_false() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Boolean, true)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", data)?;
+    let sql = "SELECT c1 IS FALSE as f FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| f     |",
+        "+-------+",
+        "| false |",
+        "| true  |",
+        "| false |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_is_not_true() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Boolean, true)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", data)?;
+    let sql = "SELECT c1 IS NOT TRUE as nt FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| nt    |",
+        "+-------+",
+        "| false |",
+        "| true  |",
+        "| true  |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_is_not_false() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Boolean, true)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", data)?;
+    let sql = "SELECT c1 IS NOT FALSE as nf FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| nf    |",
+        "+-------+",
+        "| true  |",
+        "| false |",
+        "| true  |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_is_unknown() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Boolean, true)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", data)?;
+    let sql = "SELECT c1 IS UNKNOWN as t FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| t     |",
+        "+-------+",
+        "| false |",
+        "| false |",
+        "| true  |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_is_not_unknown() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Boolean, true)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            None,
+        ]))],
+    )?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("test", data)?;
+    let sql = "SELECT c1 IS NOT UNKNOWN as t FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| t     |",
+        "+-------+",
+        "| true  |",
+        "| true  |",
+        "| false |",
+        "+-------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -362,21 +536,19 @@ async fn query_scalar_minus_array() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT 4 - c1 FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+------------------------+",
-        "| Int64(4) Minus test.c1 |",
-        "+------------------------+",
-        "| 4                      |",
-        "| 3                      |",
-        "|                        |",
-        "| 1                      |",
-        "+------------------------+",
+        "+--------------------+",
+        "| Int64(4) - test.c1 |",
+        "+--------------------+",
+        "| 4                  |",
+        "| 3                  |",
+        "|                    |",
+        "| 1                  |",
+        "+--------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -471,6 +643,24 @@ async fn test_not_expressions() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_negative_expressions() -> Result<()> {
+    let ctx = SessionContext::new();
+
+    let sql = "SELECT null, -null";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+------+----------+",
+        "| NULL | (- NULL) |",
+        "+------+----------+",
+        "|      |          |",
+        "+------+----------+",
+    ];
+
+    assert_batches_eq!(expected, &actual);
     Ok(())
 }
 
@@ -645,15 +835,25 @@ async fn test_struct_literals() -> Result<()> {
 }
 
 #[tokio::test]
+async fn binary_bitwise_shift() -> Result<()> {
+    test_expression!("2 << 10", "2048");
+    test_expression!("2048 >> 10", "2");
+    test_expression!("2048 << NULL", "NULL");
+    test_expression!("2048 >> NULL", "NULL");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_interval_expressions() -> Result<()> {
     // day nano intervals
     test_expression!(
         "interval '1'",
-        "0 years 0 mons 0 days 0 hours 0 mins 1.00 secs"
+        "0 years 0 mons 0 days 0 hours 0 mins 1.000 secs"
     );
     test_expression!(
         "interval '1 second'",
-        "0 years 0 mons 0 days 0 hours 0 mins 1.00 secs"
+        "0 years 0 mons 0 days 0 hours 0 mins 1.000 secs"
     );
     test_expression!(
         "interval '500 milliseconds'",
@@ -661,47 +861,47 @@ async fn test_interval_expressions() -> Result<()> {
     );
     test_expression!(
         "interval '5 second'",
-        "0 years 0 mons 0 days 0 hours 0 mins 5.00 secs"
+        "0 years 0 mons 0 days 0 hours 0 mins 5.000 secs"
     );
     test_expression!(
         "interval '0.5 minute'",
-        "0 years 0 mons 0 days 0 hours 0 mins 30.00 secs"
+        "0 years 0 mons 0 days 0 hours 0 mins 30.000 secs"
     );
     test_expression!(
         "interval '.5 minute'",
-        "0 years 0 mons 0 days 0 hours 0 mins 30.00 secs"
+        "0 years 0 mons 0 days 0 hours 0 mins 30.000 secs"
     );
     test_expression!(
         "interval '5 minute'",
-        "0 years 0 mons 0 days 0 hours 5 mins 0.00 secs"
+        "0 years 0 mons 0 days 0 hours 5 mins 0.000 secs"
     );
     test_expression!(
         "interval '5 minute 1 second'",
-        "0 years 0 mons 0 days 0 hours 5 mins 1.00 secs"
+        "0 years 0 mons 0 days 0 hours 5 mins 1.000 secs"
     );
     test_expression!(
         "interval '1 hour'",
-        "0 years 0 mons 0 days 1 hours 0 mins 0.00 secs"
+        "0 years 0 mons 0 days 1 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '5 hour'",
-        "0 years 0 mons 0 days 5 hours 0 mins 0.00 secs"
+        "0 years 0 mons 0 days 5 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '1 day'",
-        "0 years 0 mons 1 days 0 hours 0 mins 0.00 secs"
+        "0 years 0 mons 1 days 0 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '1 week'",
-        "0 years 0 mons 7 days 0 hours 0 mins 0.00 secs"
+        "0 years 0 mons 7 days 0 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '2 weeks'",
-        "0 years 0 mons 14 days 0 hours 0 mins 0.00 secs"
+        "0 years 0 mons 14 days 0 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '1 day 1'",
-        "0 years 0 mons 1 days 0 hours 0 mins 1.00 secs"
+        "0 years 0 mons 1 days 0 hours 0 mins 1.000 secs"
     );
     test_expression!(
         "interval '0.5'",
@@ -709,19 +909,19 @@ async fn test_interval_expressions() -> Result<()> {
     );
     test_expression!(
         "interval '0.5 day 1'",
-        "0 years 0 mons 0 days 12 hours 0 mins 1.00 secs"
+        "0 years 0 mons 0 days 12 hours 0 mins 1.000 secs"
     );
     test_expression!(
         "interval '0.49 day'",
-        "0 years 0 mons 0 days 11 hours 45 mins 36.00 secs"
+        "0 years 0 mons 0 days 11 hours 45 mins 36.000 secs"
     );
     test_expression!(
         "interval '0.499 day'",
-        "0 years 0 mons 0 days 11 hours 58 mins 33.596 secs"
+        "0 years 0 mons 0 days 11 hours 58 mins 33.600 secs"
     );
     test_expression!(
         "interval '0.4999 day'",
-        "0 years 0 mons 0 days 11 hours 59 mins 51.364 secs"
+        "0 years 0 mons 0 days 11 hours 59 mins 51.360 secs"
     );
     test_expression!(
         "interval '0.49999 day'",
@@ -729,16 +929,16 @@ async fn test_interval_expressions() -> Result<()> {
     );
     test_expression!(
         "interval '0.49999999999 day'",
-        "0 years 0 mons 0 days 12 hours 0 mins 0.00 secs"
+        "0 years 0 mons 0 days 11 hours 59 mins 59.999999136 secs"
     );
     test_expression!(
         "interval '5 day'",
-        "0 years 0 mons 5 days 0 hours 0 mins 0.00 secs"
+        "0 years 0 mons 5 days 0 hours 0 mins 0.000 secs"
     );
     // Hour is ignored, this matches PostgreSQL
     test_expression!(
         "interval '5 day' hour",
-        "0 years 0 mons 5 days 0 hours 0 mins 0.00 secs"
+        "0 years 0 mons 5 days 0 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '5 day 4 hours 3 minutes 2 seconds 100 milliseconds'",
@@ -747,11 +947,11 @@ async fn test_interval_expressions() -> Result<()> {
     // month intervals
     test_expression!(
         "interval '0.5 month'",
-        "0 years 0 mons 15 days 0 hours 0 mins 0.00 secs"
+        "0 years 0 mons 15 days 0 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '0.5' month",
-        "0 years 0 mons 15 days 0 hours 0 mins 0.00 secs"
+        "0 years 0 mons 15 days 0 hours 0 mins 0.000 secs"
     );
     test_expression!(
         "interval '1 month'",
@@ -800,19 +1000,19 @@ async fn test_interval_expressions() -> Result<()> {
     // complex
     test_expression!(
         "interval '1 year 1 day'",
-        "0 years 12 mons 1 days 0 hours 0 mins 0.00 secs"
+        "0 years 12 mons 1 days 0 hours 0 mins 0.000000000 secs"
     );
     test_expression!(
         "interval '1 year 1 day 1 hour'",
-        "0 years 12 mons 1 days 1 hours 0 mins 0.00 secs"
+        "0 years 12 mons 1 days 1 hours 0 mins 0.000000000 secs"
     );
     test_expression!(
         "interval '1 year 1 day 1 hour 1 minute'",
-        "0 years 12 mons 1 days 1 hours 1 mins 0.00 secs"
+        "0 years 12 mons 1 days 1 hours 1 mins 0.000000000 secs"
     );
     test_expression!(
         "interval '1 year 1 day 1 hour 1 minute 1 second'",
-        "0 years 12 mons 1 days 1 hours 1 mins 1.00 secs"
+        "0 years 12 mons 1 days 1 hours 1 mins 1.000000000 secs"
     );
 
     Ok(())
@@ -897,15 +1097,21 @@ async fn test_string_expressions() -> Result<()> {
     test_expression!("to_hex(9223372036854775807)", "7fffffffffffffff");
     test_expression!("to_hex(CAST(NULL AS int))", "NULL");
     test_expression!("trim(' tom ')", "tom");
+    test_expression!("trim(LEADING ' tom ')", "tom ");
+    test_expression!("trim(TRAILING ' tom ')", " tom");
+    test_expression!("trim(BOTH ' tom ')", "tom");
     test_expression!("trim(LEADING ' ' FROM ' tom ')", "tom ");
     test_expression!("trim(TRAILING ' ' FROM ' tom ')", " tom");
     test_expression!("trim(BOTH ' ' FROM ' tom ')", "tom");
+    test_expression!("trim(' ' FROM ' tom ')", "tom");
     test_expression!("trim(LEADING 'x' FROM 'xxxtomxxx')", "tomxxx");
     test_expression!("trim(TRAILING 'x' FROM 'xxxtomxxx')", "xxxtom");
     test_expression!("trim(BOTH 'x' FROM 'xxxtomxx')", "tom");
+    test_expression!("trim('x' FROM 'xxxtomxx')", "tom");
     test_expression!("trim(LEADING 'xy' FROM 'xyxabcxyzdefxyx')", "abcxyzdefxyx");
     test_expression!("trim(TRAILING 'xy' FROM 'xyxabcxyzdefxyx')", "xyxabcxyzdef");
     test_expression!("trim(BOTH 'xy' FROM 'xyxabcxyzdefxyx')", "abcxyzdef");
+    test_expression!("trim('xy' FROM 'xyxabcxyzdefxyx')", "abcxyzdef");
     test_expression!("trim(' tom')", "tom");
     test_expression!("trim('')", "");
     test_expression!("trim('tom ')", "tom");
@@ -964,12 +1170,22 @@ async fn test_cast_expressions() -> Result<()> {
 
 #[tokio::test]
 async fn test_random_expression() -> Result<()> {
-    let ctx = create_ctx()?;
+    let ctx = create_ctx();
     let sql = "SELECT random() r1";
     let actual = execute(&ctx, sql).await;
     let r1 = actual[0][0].parse::<f64>().unwrap();
     assert!(0.0 <= r1);
     assert!(r1 < 1.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_uuid_expression() -> Result<()> {
+    let ctx = create_ctx();
+    let sql = "SELECT uuid()";
+    let actual = execute(&ctx, sql).await;
+    let uuid = actual[0][0].parse::<uuid::Uuid>().unwrap();
+    assert_eq!(uuid.get_version_num(), 4);
     Ok(())
 }
 
@@ -1025,6 +1241,11 @@ async fn test_extract_date_part() -> Result<()> {
         "EXTRACT(year FROM to_timestamp('2020-09-08T12:00:00+00:00'))",
         "2020"
     );
+    test_expression!("date_part('QUARTER', CAST('2000-01-01' AS DATE))", "1");
+    test_expression!(
+        "EXTRACT(quarter FROM to_timestamp('2020-09-08T12:00:00+00:00'))",
+        "3"
+    );
     test_expression!("date_part('MONTH', CAST('2000-01-01' AS DATE))", "1");
     test_expression!(
         "EXTRACT(month FROM to_timestamp('2020-09-08T12:00:00+00:00'))",
@@ -1040,6 +1261,16 @@ async fn test_extract_date_part() -> Result<()> {
         "EXTRACT(day FROM to_timestamp('2020-09-08T12:00:00+00:00'))",
         "8"
     );
+    test_expression!("date_part('DOY', CAST('2000-01-01' AS DATE))", "1");
+    test_expression!(
+        "EXTRACT(doy FROM to_timestamp('2020-09-08T12:00:00+00:00'))",
+        "252"
+    );
+    test_expression!("date_part('DOW', CAST('2000-01-01' AS DATE))", "6");
+    test_expression!(
+        "EXTRACT(dow FROM to_timestamp('2020-09-08T12:00:00+00:00'))",
+        "2"
+    );
     test_expression!("date_part('HOUR', CAST('2000-01-01' AS DATE))", "0");
     test_expression!(
         "EXTRACT(hour FROM to_timestamp('2020-09-08T12:03:03+00:00'))",
@@ -1054,13 +1285,117 @@ async fn test_extract_date_part() -> Result<()> {
         "12"
     );
     test_expression!(
-        "EXTRACT(second FROM to_timestamp('2020-09-08T12:00:12+00:00'))",
-        "12"
+        "EXTRACT(second FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12.12345678"
     );
     test_expression!(
-        "date_part('second', to_timestamp('2020-09-08T12:00:12+00:00'))",
-        "12"
+        "EXTRACT(millisecond FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12123.45678"
     );
+    test_expression!(
+        "EXTRACT(microsecond FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12123456.78"
+    );
+    test_expression!(
+        "EXTRACT(nanosecond FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12123456780"
+    );
+    test_expression!(
+        "date_part('second', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12.12345678"
+    );
+    test_expression!(
+        "date_part('millisecond', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12123.45678"
+    );
+    test_expression!(
+        "date_part('microsecond', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12123456.78"
+    );
+    test_expression!(
+        "date_part('nanosecond', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "12123456780"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_extract_date_part_func() -> Result<()> {
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "year"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "quarter"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "month"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "week"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!("(date_part('{0}', now()) = EXTRACT({0} FROM now()))", "day"),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "hour"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "minute"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "second"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "millisecond"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "microsecond"
+        ),
+        "true"
+    );
+    test_expression!(
+        format!(
+            "(date_part('{0}', now()) = EXTRACT({0} FROM now()))",
+            "nanosecond"
+        ),
+        "true"
+    );
+
     Ok(())
 }
 
@@ -1259,7 +1594,7 @@ async fn csv_count_star() -> Result<()> {
 
 #[tokio::test]
 async fn csv_query_avg_sqrt() -> Result<()> {
-    let ctx = create_ctx()?;
+    let ctx = create_ctx();
     register_aggregate_csv(&ctx).await?;
     let sql = "SELECT avg(custom_sqrt(c12)) FROM aggregate_test_100";
     let mut actual = execute(&ctx, sql).await;
@@ -1272,7 +1607,7 @@ async fn csv_query_avg_sqrt() -> Result<()> {
 // this query used to deadlock due to the call udf(udf())
 #[tokio::test]
 async fn csv_query_sqrt_sqrt() -> Result<()> {
-    let ctx = create_ctx()?;
+    let ctx = create_ctx();
     register_aggregate_csv(&ctx).await?;
     let sql = "SELECT sqrt(sqrt(c12)) FROM aggregate_test_100 LIMIT 1";
     let actual = execute(&ctx, sql).await;
@@ -1381,7 +1716,7 @@ async fn comparisons_with_null_lt() {
     ];
 
     for sql in cases {
-        println!("Computing: {}", sql);
+        println!("Computing: {sql}");
 
         let mut actual = execute_to_batches(&ctx, sql).await;
         assert_eq!(actual.len(), 1);
@@ -1429,7 +1764,7 @@ async fn binary_mathematical_operator_with_null_lt() {
     ];
 
     for sql in cases {
-        println!("Computing: {}", sql);
+        println!("Computing: {sql}");
 
         let mut actual = execute_to_batches(&ctx, sql).await;
         assert_eq!(actual.len(), 1);
@@ -1440,4 +1775,67 @@ async fn binary_mathematical_operator_with_null_lt() {
         assert!(batch.columns()[0].is_null(0));
         assert!(batch.columns()[0].is_null(1));
     }
+}
+
+#[tokio::test]
+async fn query_binary_eq() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c1", DataType::Binary, true),
+        Field::new("c2", DataType::LargeBinary, true),
+        Field::new("c3", DataType::Binary, true),
+        Field::new("c4", DataType::LargeBinary, true),
+    ]));
+
+    let c1 = BinaryArray::from_opt_vec(vec![
+        Some(b"one"),
+        Some(b"two"),
+        None,
+        Some(b""),
+        Some(b"three"),
+    ]);
+    let c2 = LargeBinaryArray::from_opt_vec(vec![
+        Some(b"one"),
+        Some(b"two"),
+        None,
+        Some(b""),
+        Some(b"three"),
+    ]);
+    let c3 = BinaryArray::from_opt_vec(vec![
+        Some(b"one"),
+        Some(b""),
+        None,
+        Some(b""),
+        Some(b"three"),
+    ]);
+    let c4 = LargeBinaryArray::from_opt_vec(vec![
+        Some(b"one"),
+        Some(b"two"),
+        None,
+        Some(b""),
+        Some(b""),
+    ]);
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(c1), Arc::new(c2), Arc::new(c3), Arc::new(c4)],
+    )?;
+
+    let ctx = SessionContext::new();
+
+    ctx.register_batch("test", data)?;
+
+    let sql = "
+        SELECT sha256(c1)=digest('one', 'sha256'), sha256(c2)=sha256('two'), digest(c1, 'blake2b')=digest(c3, 'blake2b'), c2=c4
+        FROM test
+    ";
+    let actual = execute(&ctx, sql).await;
+    let expected = vec![
+        vec!["true", "false", "true", "true"],
+        vec!["false", "true", "false", "true"],
+        vec!["NULL", "NULL", "NULL", "NULL"],
+        vec!["false", "false", "true", "true"],
+        vec!["false", "false", "true", "false"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
 }

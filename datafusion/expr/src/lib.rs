@@ -28,7 +28,6 @@
 mod accumulator;
 pub mod aggregate_function;
 pub mod array_expressions;
-pub mod binary_rule;
 mod built_in_function;
 mod columnar_value;
 pub mod conditional_expressions;
@@ -53,11 +52,13 @@ pub mod utils;
 pub mod window_frame;
 pub mod window_function;
 
-pub use accumulator::{Accumulator, AggregateState};
+pub use accumulator::Accumulator;
 pub use aggregate_function::AggregateFunction;
 pub use built_in_function::BuiltinScalarFunction;
-pub use columnar_value::{ColumnarValue, NullColumnarValue};
-pub use expr::Expr;
+pub use columnar_value::ColumnarValue;
+pub use expr::{
+    Between, BinaryExpr, Case, Cast, Expr, GetIndexedField, GroupingSet, Like, TryCast,
+};
 pub use expr_fn::*;
 pub use expr_schema::ExprSchemable;
 pub use function::{
@@ -65,7 +66,18 @@ pub use function::{
     StateTypeFunction,
 };
 pub use literal::{lit, lit_timestamp_nano, Literal, TimestampLiteral};
-pub use logical_plan::{LogicalPlan, LogicalPlanBuilder, PlanVisitor};
+pub use logical_plan::{
+    builder::{
+        build_join_schema, union, wrap_projection_for_join_if_necessary, UNNAMED_TABLE,
+    },
+    Aggregate, CreateCatalog, CreateCatalogSchema, CreateExternalTable,
+    CreateMemoryTable, CreateView, CrossJoin, DescribeTable, Distinct, DmlStatement,
+    DropTable, DropView, EmptyRelation, Explain, Extension, Filter, Join, JoinConstraint,
+    JoinType, Limit, LogicalPlan, LogicalPlanBuilder, Partitioning, PlanType,
+    PlanVisitor, Projection, Repartition, SetVariable, Sort, StringifiedPlan, Subquery,
+    SubqueryAlias, TableScan, ToStringifiedPlan, Union, Unnest, UserDefinedLogicalNode,
+    Values, Window, WriteOp,
+};
 pub use nullif::SUPPORTED_NULLIF_TYPES;
 pub use operator::Operator;
 pub use signature::{Signature, TypeSignature, Volatility};

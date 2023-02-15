@@ -16,17 +16,25 @@
 // under the License.
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::Result;
 use object_store::{GetResult, ListResult, ObjectMeta, ObjectStore};
+use object_store::{MultipartId, Result};
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWrite, BufReader};
 
 /// Wraps a [`ObjectStore`] and makes its get response return chunks
+/// in a controllable manner.
+///
+/// A `ChunkedStore` makes the memory consumption and performance of
+/// the wrapped [`ObjectStore`] worse. It is intended for use within
+/// tests, to control the chunks in the produced output streams. For
+/// example, it is used to verify the delimiting logic in
+/// newline_delimited_stream.
 ///
 /// TODO: Upstream into object_store_rs
 #[derive(Debug)]
@@ -53,25 +61,94 @@ impl ObjectStore for ChunkedStore {
         self.inner.put(location, bytes).await
     }
 
-    async fn get(&self, location: &Path) -> Result<GetResult> {
-        let bytes = self.inner.get(location).await?.bytes().await?;
-        let mut offset = 0;
-        let chunk_size = self.chunk_size;
+    async fn put_multipart(
+        &self,
+        location: &Path,
+    ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        self.inner.put_multipart(location).await
+    }
 
-        Ok(GetResult::Stream(
-            futures::stream::iter(std::iter::from_fn(move || {
-                let remaining = bytes.len() - offset;
-                if remaining == 0 {
-                    return None;
-                }
-                let to_read = remaining.min(chunk_size);
-                let next_offset = offset + to_read;
-                let slice = bytes.slice(offset..next_offset);
-                offset = next_offset;
-                Some(Ok(slice))
-            }))
-            .boxed(),
-        ))
+    async fn abort_multipart(
+        &self,
+        location: &Path,
+        multipart_id: &MultipartId,
+    ) -> Result<()> {
+        self.inner.abort_multipart(location, multipart_id).await
+    }
+
+    async fn get(&self, location: &Path) -> Result<GetResult> {
+        match self.inner.get(location).await? {
+            GetResult::File(std_file, ..) => {
+                let file = tokio::fs::File::from_std(std_file);
+                let reader = BufReader::new(file);
+                Ok(GetResult::Stream(
+                    futures::stream::unfold(
+                        (reader, self.chunk_size),
+                        |(mut reader, chunk_size)| async move {
+                            let mut buffer = BytesMut::zeroed(chunk_size);
+                            let size = reader.read(&mut buffer).await.map_err(|e| {
+                                object_store::Error::Generic {
+                                    store: "ChunkedStore",
+                                    source: Box::new(e),
+                                }
+                            });
+                            match size {
+                                Ok(0) => None,
+                                Ok(value) => Some((
+                                    Ok(buffer.split_to(value).freeze()),
+                                    (reader, chunk_size),
+                                )),
+                                Err(e) => Some((Err(e), (reader, chunk_size))),
+                            }
+                        },
+                    )
+                    .boxed(),
+                ))
+            }
+            GetResult::Stream(stream) => {
+                let buffer = BytesMut::new();
+                Ok(GetResult::Stream(
+                    futures::stream::unfold(
+                        (stream, buffer, false, self.chunk_size),
+                        |(mut stream, mut buffer, mut exhausted, chunk_size)| async move {
+                            // Keep accumulating bytes until we reach capacity as long as
+                            // the stream can provide them:
+                            if exhausted {
+                                return None;
+                            }
+                            while buffer.len() < chunk_size {
+                                match stream.next().await {
+                                    None => {
+                                        exhausted = true;
+                                        let slice = buffer.split_off(0).freeze();
+                                        return Some((
+                                            Ok(slice),
+                                            (stream, buffer, exhausted, chunk_size),
+                                        ));
+                                    }
+                                    Some(Ok(bytes)) => {
+                                        buffer.put(bytes);
+                                    }
+                                    Some(Err(e)) => {
+                                        return Some((
+                                            Err(object_store::Error::Generic {
+                                                store: "ChunkedStore",
+                                                source: Box::new(e),
+                                            }),
+                                            (stream, buffer, exhausted, chunk_size),
+                                        ))
+                                    }
+                                };
+                            }
+                            // Return the chunked values as the next value in the stream
+                            let slice = buffer.split_to(chunk_size).freeze();
+                            Some((Ok(slice), (stream, buffer, exhausted, chunk_size)))
+                        },
+                    )
+                    .boxed(),
+                ))
+            }
+        }
     }
 
     async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
@@ -109,7 +186,9 @@ impl ObjectStore for ChunkedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use object_store::memory::InMemory;
+    use object_store::path::Path;
 
     #[tokio::test]
     async fn test_chunked() {

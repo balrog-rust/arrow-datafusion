@@ -19,22 +19,23 @@
 
 # Release Process
 
-## Branching
+DataFusion typically has major releases every two weeks, including breaking API changes.
 
-### Major Release
+Patch releases are made on an adhoc basis, but we try and avoid them given the frequent major releases.
 
-DataFusion typically has major releases from the `master` branch every 3 months, including breaking API changes.
+## Branching Policy
 
-### Minor Release
+- When we prepare a new release, we create a release branch, such as `branch-18` in the Apache repository (not in a fork)
+- We update the crate version and generate the changelog in this branch and create a PR against the master branch
+- Once the PR is approved and merged, we tag the rc in the release branch, and release from the release branch
+- Bug fixes can be merged to the release branch and patch releases can be created from the release branch
 
-Starting v7.0.0, we are experimenting with maintaining an active stable release branch (e.g. `maint-7.x`). Every month, we will review the `maint-*` branch and prepare a minor release (e.g. v7.1.0) when necessary. A patch release (v7.0.1) can be requested on demand if it is urgent bug/security fix.
+#### How to add changes to `branch-*` branch?
 
-#### How to add changes to `maint-*` branch?
-
-If you would like to propose your change for inclusion in the maintenance branch
+If you would like to propose your change for inclusion in a release branch
 
 1. follow normal workflow to create PR to `master` branch and wait for its approval and merges.
-2. after PR is squash merged to `master`, branch from most recent maintenance branch (e.g. `maint-7-x`), cherry-pick the commit and create a PR to maintenance branch (e.g. `maint-7-x`).
+2. after PR is squash merged to `master`, branch from most recent release branch (e.g. `branch-18`), cherry-pick the commit and create a PR to release branch.
 
 ## Prerequisite
 
@@ -286,8 +287,12 @@ of the following crates:
 Download and unpack the official release tarball
 
 Verify that the Cargo.toml in the tarball contains the correct version
-(e.g. `version = "5.1.0"`) and then publish the crates with the
-following commands. Crates need to be published in the correct order as shown in this diagram.
+(e.g. `version = "5.1.0"`) and then publish the crates by running the script `release-crates.sh`
+in a directory extracted from the source tarball that was voted on. Note that this script doesn't
+work if run in a Git repo.
+
+Alternatively the crates can be published one at a time with the following commands. Crates need to be
+published in the correct order as shown in this diagram.
 
 ![](crate-deps.svg)
 
@@ -307,20 +312,58 @@ dot -Tsvg dev/release/crate-deps.dot > dev/release/crate-deps.svg
 (cd datafusion/optimizer && cargo publish)
 (cd datafusion/core && cargo publish)
 (cd datafusion/proto && cargo publish)
-(cd datafusion-cli && cargo publish)
+(cd datafusion/substrait && cargo publish)
 ```
 
-### Publish datafusion-cli on Homebrew and crates.io
-
-For Homebrew, Send a simple PR to update tag and commit hash for the datafusion
-formula in homebrew-core. Here is an example PR:
-https://github.com/Homebrew/homebrew-core/pull/89562.
-
-For crates.io, run
+The CLI needs a `--no-verify` argument because `build.rs` generates source into the `src` directory.
 
 ```shell
-(cd datafusion-cli && cargo publish)
+(cd datafusion-cli && cargo publish --no-verify)
 ```
+
+### Publish datafusion-cli on Homebrew
+
+Run `publish_homebrew.sh` to publish `datafusion-cli` on Homebrew. In order to do so it is necessary to
+fork the `homebrew-core` repo https://github.com/Homebrew/homebrew-core/, have Homebrew installed on your
+macOS/Linux/WSL2 and properly configured and have a Github Personal Access Token that has permission to file pull requests in the `homebrew-core` repo.
+
+#### Fork the `homebrew-core` repo
+
+Go to https://github.com/Homebrew/homebrew-core/ and fork the repo.
+
+#### Install and configure Homebrew
+
+Please visit https://brew.sh/ to obtain Homebrew. In addition to that please check out https://docs.brew.sh/Homebrew-on-Linux if you are on Linux or WSL2.
+
+Before running the script make sure that you can run the following command in your bash to make sure
+that `brew` has been installed and configured properly:
+
+```bash
+brew --version
+```
+
+#### Create a Github Personal Access Token
+
+To create a Github Personal Access Token, please visit https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token for instructions.
+
+- Make sure to select either **All repositories** or **Only selected repositories** so that you have access to **Repository permissions**.
+- If you only use the token for selected repos make sure you include your
+  fork of `homebrew-core` in the list of repos under **Selected repositories**.
+- Make sure to have **Read and write** access enabled for pull requests in your **Repository permissions**.
+
+After all of the above is complete execute the following command:
+
+```bash
+dev/release/publish_homebrew.sh <version> <github-user> <github-token> <homebrew-default-branch-name>
+```
+
+Note that sometimes someone else has already submitted a PR to update the datafusion formula in homebrew.
+In this case you will get an error with a message that your PR is a duplicate of an existing one. In this
+case no further action is required.
+
+Alternatively manually submit a simple PR to update tag and commit hash for the datafusion
+formula in homebrew-core. Here is an example PR:
+https://github.com/Homebrew/homebrew-core/pull/89562.
 
 ### Call the vote
 
@@ -351,3 +394,80 @@ https://crates.io/crates/datafusion-proto/8.0.0
 https://crates.io/crates/datafusion-row/8.0.0
 https://crates.io/crates/datafusion-sql/8.0.0
 ```
+
+### Add the release to Apache Reporter
+
+Add the release to https://reporter.apache.org/addrelease.html?arrow with a version name prefixed with `RS-DATAFUSION-`,
+for example `RS-DATAFUSION-14.0.0`.
+
+The release information is used to generate a template for a board report (see example
+[here](https://github.com/apache/arrow/pull/14357)).
+
+### Delete old RCs and Releases
+
+See the ASF documentation on [when to archive](https://www.apache.org/legal/release-policy.html#when-to-archive)
+for more information.
+
+#### Deleting old release candidates from `dev` svn
+
+Release candidates should be deleted once the release is published.
+
+Get a list of DataFusion release candidates:
+
+```bash
+svn ls https://dist.apache.org/repos/dist/dev/arrow | grep datafusion
+```
+
+Delete a release candidate:
+
+```bash
+svn delete -m "delete old DataFusion RC" https://dist.apache.org/repos/dist/dev/arrow/apache-arrow-datafusion-7.1.0-rc1/
+```
+
+#### Deleting old releases from `release` svn
+
+Only the latest release should be available. Delete old releases after publishing the new release.
+
+Get a list of DataFusion releases:
+
+```bash
+svn ls https://dist.apache.org/repos/dist/release/arrow | grep datafusion
+```
+
+Delete a release:
+
+```bash
+svn delete -m "delete old DataFusion release" https://dist.apache.org/repos/dist/release/arrow/arrow-datafusion-7.0.0
+```
+
+### Publish the User Guide to the Arrow Site
+
+- Run the `build.sh` in the `docs` directory from the release tarball.
+- Clone the [arrow-site](https://github.com/apache/arrow-site) repository
+- Checkout the `asf-site` branch
+- Copy content from `docs/build/html/*` to the `datafusion` directory in arrow-site
+- Create a PR against the `asf-site` branch ([example](https://github.com/apache/arrow-site/pull/237))
+- Once the PR is merged, the content will be published to https://arrow.apache.org/datafusion/ by GitHub Pages (this
+  can take some time).
+
+### Optional: Write a blog post announcing the release
+
+We typically crowdsource release announcements by collaborating on a Google document, usually starting
+with a copy of the previous release announcement.
+
+Run the following commands to get the number of commits and number of unique contributors for inclusion in the blog post.
+
+```bash
+git log --pretty=oneline 10.0.0..11.0.0 datafusion datafusion-cli datafusion-examples | wc -l
+git shortlog -sn 10.0.0..11.0.0 datafusion datafusion-cli datafusion-examples | wc -l
+```
+
+Once there is consensus on the contents of the post, create a PR to add a blog post to the
+[arrow-site](https://github.com/apache/arrow-site) repository. Note that there is no need for a formal
+PMC vote on the blog post contents since this isn't considered to be a "release".
+
+Here is an example blog post PR:
+
+- https://github.com/apache/arrow-site/pull/217
+
+Once the PR is merged, a GitHub action will publish the new blog post to https://arrow.apache.org/blog/.

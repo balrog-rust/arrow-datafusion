@@ -30,9 +30,17 @@ STORED AS PARQUET
 LOCATION '/mnt/nyctaxi/tripdata.parquet';
 ```
 
-CSV data sources can also be registered by executing a `CREATE EXTERNAL TABLE` SQL statement. It is necessary to
-provide schema information for CSV files since DataFusion does not automatically infer the schema when using SQL
-to query CSV files.
+CSV data sources can also be registered by executing a `CREATE EXTERNAL TABLE` SQL statement. The schema will be
+inferred based on scanning a subset of the file.
+
+```sql
+CREATE EXTERNAL TABLE test
+STORED AS CSV
+WITH HEADER ROW
+LOCATION '/path/to/aggregate_simple.csv';
+```
+
+It is also possible to specify the schema manually.
 
 ```sql
 CREATE EXTERNAL TABLE test (
@@ -70,30 +78,77 @@ PARTITIONED BY (year, month)
 LOCATION '/mnt/nyctaxi';
 ```
 
-## CREATE MEMORY TABLE
+## CREATE TABLE
 
-Memory table can be created with query.
+An in-memory table can be created with a query or values list.
 
-```
-CREATE TABLE TABLE_NAME AS [SELECT | VALUES LIST]
-```
+<pre>
+CREATE [OR REPLACE] TABLE [IF NOT EXISTS] <b><i>table_name</i></b> AS [SELECT | VALUES LIST];
+</pre>
 
 ```sql
-CREATE TABLE valuetable AS VALUES(1,'HELLO'),(12,'DATAFUSION');
+CREATE TABLE IF NOT EXISTS valuetable AS VALUES(1,'HELLO'),(12,'DATAFUSION');
 
 CREATE TABLE memtable as select * from valuetable;
 ```
 
 ## DROP TABLE
 
-The table can be deleted.
+Removes the table from DataFusion's catalog.
 
-```
-DROP TABLE [ IF EXISTS ] name
-```
+<pre>
+DROP TABLE [ IF EXISTS ] <b><i>table_name</i></b>;
+</pre>
 
 ```sql
 CREATE TABLE users AS VALUES(1,2),(2,3);
-
 DROP TABLE users;
+-- or use 'if exists' to silently ignore if the table doesn't exist
+DROP TABLE IF EXISTS nonexistent_table;
+```
+
+## CREATE VIEW
+
+View is a virtual table based on the result of a SQL query. It can be created from an existing table or values list.
+
+<pre>
+CREATE VIEW <i><b>view_name</b></i> AS statement;
+</pre>
+
+```sql
+CREATE TABLE users AS VALUES(1,2),(2,3),(3,4),(4,5);
+CREATE VIEW test AS SELECT column1 FROM users;
+SELECT * FROM test;
++---------+
+| column1 |
++---------+
+| 1       |
+| 2       |
+| 3       |
+| 4       |
++---------+
+```
+
+```sql
+CREATE VIEW test AS VALUES(1,2),(5,6);
+SELECT * FROM test;
++---------+---------+
+| column1 | column2 |
++---------+---------+
+| 1       | 2       |
+| 5       | 6       |
++---------+---------+
+```
+
+## DROP VIEW
+
+Removes the view from DataFusion's catalog.
+
+<pre>
+DROP VIEW [ IF EXISTS ] <b><i>view_name</i></b>;
+</pre>
+
+```sql
+-- drop users_v view from the customer_a schema
+DROP VIEW IF EXISTS customer_a.users_v;
 ```

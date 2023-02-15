@@ -17,13 +17,19 @@
 
 //! Utility functions to make testing DataFusion based crates easier
 
-use std::collections::BTreeMap;
+use std::any::Any;
+use std::collections::HashMap;
 use std::{env, error::Error, path::PathBuf, sync::Arc};
 
-use crate::datasource::empty::EmptyTable;
-use crate::logical_plan::{provider_as_source, LogicalPlanBuilder, UNNAMED_TABLE};
+use crate::datasource::datasource::TableProviderFactory;
+use crate::datasource::{empty::EmptyTable, provider_as_source, TableProvider};
+use crate::execution::context::SessionState;
+use crate::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
+use crate::physical_plan::ExecutionPlan;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
 use datafusion_common::DataFusionError;
+use datafusion_expr::{CreateExternalTable, Expr, TableType};
 
 /// Compares formatted output of a record batch with an expected
 /// vector of strings, with the result of pretty formatting record
@@ -98,52 +104,6 @@ macro_rules! assert_batches_sorted_eq {
     };
 }
 
-/// A macro to assert that one string is contained within another with
-/// a nice error message if they are not.
-///
-/// Usage: `assert_contains!(actual, expected)`
-///
-/// Is a macro so test error
-/// messages are on the same line as the failure;
-///
-/// Both arguments must be convertable into Strings (Into<String>)
-#[macro_export]
-macro_rules! assert_contains {
-    ($ACTUAL: expr, $EXPECTED: expr) => {
-        let actual_value: String = $ACTUAL.into();
-        let expected_value: String = $EXPECTED.into();
-        assert!(
-            actual_value.contains(&expected_value),
-            "Can not find expected in actual.\n\nExpected:\n{}\n\nActual:\n{}",
-            expected_value,
-            actual_value
-        );
-    };
-}
-
-/// A macro to assert that one string is NOT contained within another with
-/// a nice error message if they are are.
-///
-/// Usage: `assert_not_contains!(actual, unexpected)`
-///
-/// Is a macro so test error
-/// messages are on the same line as the failure;
-///
-/// Both arguments must be convertable into Strings (Into<String>)
-#[macro_export]
-macro_rules! assert_not_contains {
-    ($ACTUAL: expr, $UNEXPECTED: expr) => {
-        let actual_value: String = $ACTUAL.into();
-        let unexpected_value: String = $UNEXPECTED.into();
-        assert!(
-            !actual_value.contains(&unexpected_value),
-            "Found unexpected in actual.\n\nUnexpected:\n{}\n\nActual:\n{}",
-            unexpected_value,
-            actual_value
-        );
-    };
-}
-
 /// Returns the arrow test data directory, which is by default stored
 /// in a git submodule rooted at `testing/data`.
 ///
@@ -161,13 +121,13 @@ macro_rules! assert_not_contains {
 pub fn arrow_test_data() -> String {
     match get_data_dir("ARROW_TEST_DATA", "../../testing/data") {
         Ok(pb) => pb.display().to_string(),
-        Err(err) => panic!("failed to get arrow data dir: {}", err),
+        Err(err) => panic!("failed to get arrow data dir: {err}"),
     }
 }
 
 /// Returns the parquet test data directory, which is by default
 /// stored in a git submodule rooted at
-/// `parquest-testing/data`.
+/// `parquet-testing/data`.
 ///
 /// The default can be overridden by the optional environment variable
 /// `PARQUET_TEST_DATA`
@@ -183,7 +143,7 @@ pub fn arrow_test_data() -> String {
 pub fn parquet_test_data() -> String {
     match get_data_dir("PARQUET_TEST_DATA", "../../parquet-testing/data") {
         Ok(pb) => pb.display().to_string(),
-        Err(err) => panic!("failed to get parquet data dir: {}", err),
+        Err(err) => panic!("failed to get parquet data dir: {err}"),
     }
 }
 
@@ -196,7 +156,10 @@ pub fn parquet_test_data() -> String {
 ///  Returns either:
 /// The path referred to in `udf_env` if that variable is set and refers to a directory
 /// The submodule_data directory relative to CARGO_MANIFEST_PATH
-fn get_data_dir(udf_env: &str, submodule_data: &str) -> Result<PathBuf, Box<dyn Error>> {
+pub fn get_data_dir(
+    udf_env: &str,
+    submodule_data: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
     // Try user defined env.
     if let Ok(dir) = env::var(udf_env) {
         let trimmed = dir.trim().to_string();
@@ -269,9 +232,9 @@ pub fn scan_empty_with_partitions(
 /// Get the schema for the aggregate_test_* csv files
 pub fn aggr_test_schema() -> SchemaRef {
     let mut f1 = Field::new("c1", DataType::Utf8, false);
-    f1.set_metadata(Some(BTreeMap::from_iter(
+    f1.set_metadata(HashMap::from_iter(
         vec![("testing".into(), "test".into())].into_iter(),
-    )));
+    ));
     let schema = Schema::new(vec![
         f1,
         Field::new("c2", DataType::UInt32, false),
@@ -294,9 +257,9 @@ pub fn aggr_test_schema() -> SchemaRef {
 /// Get the schema for the aggregate_test_* csv files with an additional filed not present in the files.
 pub fn aggr_test_schema_with_missing_col() -> SchemaRef {
     let mut f1 = Field::new("c1", DataType::Utf8, false);
-    f1.set_metadata(Some(BTreeMap::from_iter(
+    f1.set_metadata(HashMap::from_iter(
         vec![("testing".into(), "test".into())].into_iter(),
-    )));
+    ));
     let schema = Schema::new(vec![
         f1,
         Field::new("c2", DataType::UInt32, false),
@@ -315,6 +278,58 @@ pub fn aggr_test_schema_with_missing_col() -> SchemaRef {
     ]);
 
     Arc::new(schema)
+}
+
+/// TableFactory for tests
+pub struct TestTableFactory {}
+
+#[async_trait]
+impl TableProviderFactory for TestTableFactory {
+    async fn create(
+        &self,
+        _: &SessionState,
+        cmd: &CreateExternalTable,
+    ) -> datafusion_common::Result<Arc<dyn TableProvider>> {
+        Ok(Arc::new(TestTableProvider {
+            url: cmd.location.to_string(),
+            schema: Arc::new(cmd.schema.as_ref().into()),
+        }))
+    }
+}
+
+/// TableProvider for testing purposes
+pub struct TestTableProvider {
+    /// URL of table files or folder
+    pub url: String,
+    /// test table schema
+    pub schema: SchemaRef,
+}
+
+impl TestTableProvider {}
+
+#[async_trait]
+impl TableProvider for TestTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        unimplemented!("TestTableProvider is a stub for testing.")
+    }
+
+    async fn scan(
+        &self,
+        _state: &SessionState,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        unimplemented!("TestTableProvider is a stub for testing.")
+    }
 }
 
 #[cfg(test)]

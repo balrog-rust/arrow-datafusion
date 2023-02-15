@@ -28,9 +28,13 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
+use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_expr::{binary_rule::is_signed_numeric, ColumnarValue};
+use datafusion_expr::{
+    type_coercion::{is_null, is_signed_numeric},
+    ColumnarValue,
+};
 
 /// Invoke a compute kernel on array(s)
 macro_rules! compute_op {
@@ -103,9 +107,29 @@ impl PhysicalExpr for NegativeExpr {
                 result.map(|a| ColumnarValue::Array(a))
             }
             ColumnarValue::Scalar(scalar) => {
-                Ok(ColumnarValue::Scalar(scalar.arithmetic_negate()))
+                Ok(ColumnarValue::Scalar((scalar.arithmetic_negate())?))
             }
         }
+    }
+
+    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        vec![self.arg.clone()]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(NegativeExpr::new(children[0].clone())))
+    }
+}
+
+impl PartialEq<dyn Any> for NegativeExpr {
+    fn eq(&self, other: &dyn Any) -> bool {
+        down_cast_any_ref(other)
+            .downcast_ref::<Self>()
+            .map(|x| self.arg.eq(&x.arg))
+            .unwrap_or(false)
     }
 }
 
@@ -119,12 +143,11 @@ pub fn negative(
     input_schema: &Schema,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let data_type = arg.data_type(input_schema)?;
-    if !is_signed_numeric(&data_type) {
+    if is_null(&data_type) {
+        Ok(arg)
+    } else if !is_signed_numeric(&data_type) {
         Err(DataFusionError::Internal(
-            format!(
-                "(- '{:?}') can't be evaluated because the expression's type is {:?}, not signed numeric",
-                arg, data_type,
-            ),
+            format!("Can't create negative physical expr for (- '{arg:?}'), the type of child expr is {data_type}, not signed numeric"),
         ))
     } else {
         Ok(Arc::new(NegativeExpr::new(arg)))

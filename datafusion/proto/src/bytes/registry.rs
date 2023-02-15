@@ -17,7 +17,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use datafusion::logical_plan::FunctionRegistry;
+use datafusion::execution::registry::FunctionRegistry;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{AggregateUDF, ScalarUDF};
 
@@ -32,13 +32,13 @@ impl FunctionRegistry for NoRegistry {
 
     fn udf(&self, name: &str) -> Result<Arc<ScalarUDF>> {
         Err(DataFusionError::Plan(
-            format!("No function registry provided to deserialize, so can not deserialize User Defined Function '{}'", name))
+            format!("No function registry provided to deserialize, so can not deserialize User Defined Function '{name}'"))
         )
     }
 
     fn udaf(&self, name: &str) -> Result<Arc<AggregateUDF>> {
         Err(DataFusionError::Plan(
-            format!("No function registry provided to deserialize, so can not deserialize User Defined Aggregate Function '{}'", name))
+            format!("No function registry provided to deserialize, so can not deserialize User Defined Aggregate Function '{name}'"))
         )
     }
 }

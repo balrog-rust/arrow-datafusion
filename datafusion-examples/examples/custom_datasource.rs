@@ -20,16 +20,17 @@ use datafusion::arrow::array::{UInt64Builder, UInt8Builder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::provider_as_source;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::execution::context::{SessionState, TaskContext};
-use datafusion::logical_plan::{provider_as_source, Expr, LogicalPlanBuilder};
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::{
     project_schema, ExecutionPlan, SendableRecordBatchStream, Statistics,
 };
 use datafusion::prelude::*;
+use datafusion_expr::{Expr, LogicalPlanBuilder};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
@@ -65,12 +66,10 @@ async fn search_accounts(
         provider_as_source(Arc::new(db)),
         None,
         vec![],
-    )
-    .unwrap()
-    .build()
-    .unwrap();
+    )?
+    .build()?;
 
-    let mut dataframe = DataFrame::new(ctx.state, &logical_plan)
+    let mut dataframe = DataFrame::new(ctx.state(), logical_plan)
         .select_columns(&["id", "bank_account"])?;
 
     if let Some(f) = filter {
@@ -117,7 +116,7 @@ impl Debug for CustomDataSource {
 impl CustomDataSource {
     pub(crate) async fn create_physical_plan(
         &self,
-        projections: &Option<Vec<usize>>,
+        projections: Option<&Vec<usize>>,
         schema: SchemaRef,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(CustomExec::new(projections, schema, self.clone())))
@@ -176,7 +175,7 @@ impl TableProvider for CustomDataSource {
     async fn scan(
         &self,
         _state: &SessionState,
-        projection: &Option<Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         // filters and limit can be used here to inject some push-down operations if needed
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -193,11 +192,11 @@ struct CustomExec {
 
 impl CustomExec {
     fn new(
-        projections: &Option<Vec<usize>>,
+        projections: Option<&Vec<usize>>,
         schema: SchemaRef,
         db: CustomDataSource,
     ) -> Self {
-        let projected_schema = project_schema(&schema, projections.as_ref()).unwrap();
+        let projected_schema = project_schema(&schema, projections).unwrap();
         Self {
             db,
             projected_schema,
@@ -243,8 +242,8 @@ impl ExecutionPlan for CustomExec {
             db.data.values().cloned().collect()
         };
 
-        let mut id_array = UInt8Builder::new(users.len());
-        let mut account_array = UInt64Builder::new(users.len());
+        let mut id_array = UInt8Builder::with_capacity(users.len());
+        let mut account_array = UInt64Builder::with_capacity(users.len());
 
         for user in users {
             id_array.append_value(user.id);
@@ -265,6 +264,6 @@ impl ExecutionPlan for CustomExec {
     }
 
     fn statistics(&self) -> Statistics {
-        todo!()
+        Statistics::default()
     }
 }

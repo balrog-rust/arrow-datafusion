@@ -23,19 +23,19 @@
 //! - An ending frame boundary,
 //! - An EXCLUDE clause.
 
-use datafusion_common::{DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, ScalarValue};
 use sqlparser::ast;
-use std::cmp::Ordering;
+use sqlparser::parser::ParserError::ParserError;
 use std::convert::{From, TryFrom};
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 /// The frame-spec determines which output rows are read by an aggregate window function.
 ///
 /// The ending frame boundary can be omitted (if the BETWEEN and AND keywords that surround the
 /// starting frame boundary are also omitted), in which case the ending frame boundary defaults to
 /// CURRENT ROW.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WindowFrame {
     /// A frame type - either ROWS, RANGE or GROUPS
     pub units: WindowFrameUnits,
@@ -60,60 +60,86 @@ impl TryFrom<ast::WindowFrame> for WindowFrame {
     type Error = DataFusionError;
 
     fn try_from(value: ast::WindowFrame) -> Result<Self> {
-        let start_bound = value.start_bound.into();
-        let end_bound = value
-            .end_bound
-            .map(WindowFrameBound::from)
-            .unwrap_or(WindowFrameBound::CurrentRow);
+        let start_bound = value.start_bound.try_into()?;
+        let end_bound = match value.end_bound {
+            Some(value) => value.try_into()?,
+            None => WindowFrameBound::CurrentRow,
+        };
 
-        if let WindowFrameBound::Following(None) = start_bound {
-            Err(DataFusionError::Execution(
-                "Invalid window frame: start bound cannot be unbounded following"
-                    .to_owned(),
-            ))
-        } else if let WindowFrameBound::Preceding(None) = end_bound {
-            Err(DataFusionError::Execution(
-                "Invalid window frame: end bound cannot be unbounded preceding"
-                    .to_owned(),
-            ))
-        } else if start_bound > end_bound {
-            Err(DataFusionError::Execution(format!(
-        "Invalid window frame: start bound ({}) cannot be larger than end bound ({})",
-        start_bound, end_bound
-      )))
-        } else {
-            let units = value.units.into();
-            if units == WindowFrameUnits::Range {
-                for bound in &[start_bound, end_bound] {
-                    match bound {
-                        WindowFrameBound::Preceding(Some(v))
-                        | WindowFrameBound::Following(Some(v))
-                            if *v > 0 =>
-                        {
-                            Err(DataFusionError::NotImplemented(format!(
-                                "With WindowFrameUnits={}, the bound cannot be {} PRECEDING or FOLLOWING at the moment",
-                                units, v
-                            )))
-                        }
-                        _ => Ok(()),
-                    }?;
-                }
+        if let WindowFrameBound::Following(val) = &start_bound {
+            if val.is_null() {
+                return Err(DataFusionError::Execution(
+                    "Invalid window frame: start bound cannot be unbounded following"
+                        .to_owned(),
+                ));
             }
-            Ok(Self {
-                units,
-                start_bound,
-                end_bound,
-            })
-        }
+        } else if let WindowFrameBound::Preceding(val) = &end_bound {
+            if val.is_null() {
+                return Err(DataFusionError::Execution(
+                    "Invalid window frame: end bound cannot be unbounded preceding"
+                        .to_owned(),
+                ));
+            }
+        };
+        Ok(Self {
+            units: value.units.into(),
+            start_bound,
+            end_bound,
+        })
     }
 }
 
-impl Default for WindowFrame {
-    fn default() -> Self {
+impl WindowFrame {
+    /// Creates a new, default window frame (with the meaning of default depending on whether the
+    /// frame contains an `ORDER BY` clause.
+    pub fn new(has_order_by: bool) -> Self {
+        if has_order_by {
+            // This window frame covers the table (or partition if `PARTITION BY` is used)
+            // from beginning to the `CURRENT ROW` (with same rank). It is used when the `OVER`
+            // clause contains an `ORDER BY` clause but no frame.
+            WindowFrame {
+                units: WindowFrameUnits::Range,
+                start_bound: WindowFrameBound::Preceding(ScalarValue::Null),
+                end_bound: WindowFrameBound::CurrentRow,
+            }
+        } else {
+            // This window frame covers the whole table (or partition if `PARTITION BY` is used).
+            // It is used when the `OVER` clause does not contain an `ORDER BY` clause and there is
+            // no frame.
+            WindowFrame {
+                units: WindowFrameUnits::Rows,
+                start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                end_bound: WindowFrameBound::Following(ScalarValue::UInt64(None)),
+            }
+        }
+    }
+
+    /// Get reversed window frame. For example
+    /// `3 ROWS PRECEDING AND 2 ROWS FOLLOWING` -->
+    /// `2 ROWS PRECEDING AND 3 ROWS FOLLOWING`
+    pub fn reverse(&self) -> Self {
+        let start_bound = match &self.end_bound {
+            WindowFrameBound::Preceding(elem) => {
+                WindowFrameBound::Following(elem.clone())
+            }
+            WindowFrameBound::Following(elem) => {
+                WindowFrameBound::Preceding(elem.clone())
+            }
+            WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+        };
+        let end_bound = match &self.start_bound {
+            WindowFrameBound::Preceding(elem) => {
+                WindowFrameBound::Following(elem.clone())
+            }
+            WindowFrameBound::Following(elem) => {
+                WindowFrameBound::Preceding(elem.clone())
+            }
+            WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+        };
         WindowFrame {
-            units: WindowFrameUnits::Range,
-            start_bound: WindowFrameBound::Preceding(None),
-            end_bound: WindowFrameBound::CurrentRow,
+            units: self.units,
+            start_bound,
+            end_bound,
         }
     }
 }
@@ -121,21 +147,20 @@ impl Default for WindowFrame {
 /// There are five ways to describe starting and ending frame boundaries:
 ///
 /// 1. UNBOUNDED PRECEDING
-/// 2. <expr> PRECEDING
+/// 2. `<expr>` PRECEDING
 /// 3. CURRENT ROW
-/// 4. <expr> FOLLOWING
+/// 4. `<expr>` FOLLOWING
 /// 5. UNBOUNDED FOLLOWING
 ///
-/// in this implementation we'll only allow <expr> to be u64 (i.e. no dynamic boundary)
-#[derive(Debug, Clone, Copy, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WindowFrameBound {
     /// 1. UNBOUNDED PRECEDING
     /// The frame boundary is the first row in the partition.
     ///
-    /// 2. <expr> PRECEDING
-    /// <expr> must be a non-negative constant numeric expression. The boundary is a row that
-    /// is <expr> "units" prior to the current row.
-    Preceding(Option<u64>),
+    /// 2. `<expr>` PRECEDING
+    /// `<expr>` must be a non-negative constant numeric expression. The boundary is a row that
+    /// is `<expr>` "units" prior to the current row.
+    Preceding(ScalarValue),
     /// 3. The current row.
     ///
     /// For RANGE and GROUPS frame types, peers of the current row are also
@@ -143,75 +168,89 @@ pub enum WindowFrameBound {
     /// This is true regardless of whether CURRENT ROW is used as the starting or ending frame
     /// boundary.
     CurrentRow,
-    /// 4. This is the same as "<expr> PRECEDING" except that the boundary is <expr> units after the
+    /// 4. This is the same as "`<expr>` PRECEDING" except that the boundary is `<expr>` units after the
     /// current rather than before the current row.
     ///
     /// 5. UNBOUNDED FOLLOWING
     /// The frame boundary is the last row in the partition.
-    Following(Option<u64>),
+    Following(ScalarValue),
 }
 
-impl From<ast::WindowFrameBound> for WindowFrameBound {
-    fn from(value: ast::WindowFrameBound) -> Self {
-        match value {
-            ast::WindowFrameBound::Preceding(v) => Self::Preceding(v),
-            ast::WindowFrameBound::Following(v) => Self::Following(v),
-            ast::WindowFrameBound::CurrentRow => Self::CurrentRow,
+impl WindowFrameBound {
+    pub fn is_unbounded(&self) -> bool {
+        match self {
+            WindowFrameBound::Preceding(elem) => elem.is_null(),
+            WindowFrameBound::CurrentRow => false,
+            WindowFrameBound::Following(elem) => elem.is_null(),
         }
     }
+}
+
+impl TryFrom<ast::WindowFrameBound> for WindowFrameBound {
+    type Error = DataFusionError;
+
+    fn try_from(value: ast::WindowFrameBound) -> Result<Self> {
+        Ok(match value {
+            ast::WindowFrameBound::Preceding(Some(v)) => {
+                Self::Preceding(convert_frame_bound_to_scalar_value(*v)?)
+            }
+            ast::WindowFrameBound::Preceding(None) => Self::Preceding(ScalarValue::Null),
+            ast::WindowFrameBound::Following(Some(v)) => {
+                Self::Following(convert_frame_bound_to_scalar_value(*v)?)
+            }
+            ast::WindowFrameBound::Following(None) => Self::Following(ScalarValue::Null),
+            ast::WindowFrameBound::CurrentRow => Self::CurrentRow,
+        })
+    }
+}
+
+pub fn convert_frame_bound_to_scalar_value(v: ast::Expr) -> Result<ScalarValue> {
+    Ok(ScalarValue::Utf8(Some(match v {
+        ast::Expr::Value(ast::Value::Number(value, false))
+        | ast::Expr::Value(ast::Value::SingleQuotedString(value)) => value,
+        ast::Expr::Interval {
+            value,
+            leading_field,
+            ..
+        } => {
+            let result = match *value {
+                ast::Expr::Value(ast::Value::SingleQuotedString(item)) => item,
+                e => {
+                    let msg = format!("INTERVAL expression cannot be {e:?}");
+                    return Err(DataFusionError::SQL(ParserError(msg)));
+                }
+            };
+            if let Some(leading_field) = leading_field {
+                format!("{result} {leading_field}")
+            } else {
+                result
+            }
+        }
+        e => {
+            let msg = format!("Window frame bound cannot be {e:?}");
+            return Err(DataFusionError::Internal(msg));
+        }
+    })))
 }
 
 impl fmt::Display for WindowFrameBound {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            WindowFrameBound::Preceding(n) => {
+                if n.is_null() {
+                    f.write_str("UNBOUNDED PRECEDING")
+                } else {
+                    write!(f, "{n} PRECEDING")
+                }
+            }
             WindowFrameBound::CurrentRow => f.write_str("CURRENT ROW"),
-            WindowFrameBound::Preceding(None) => f.write_str("UNBOUNDED PRECEDING"),
-            WindowFrameBound::Following(None) => f.write_str("UNBOUNDED FOLLOWING"),
-            WindowFrameBound::Preceding(Some(n)) => write!(f, "{} PRECEDING", n),
-            WindowFrameBound::Following(Some(n)) => write!(f, "{} FOLLOWING", n),
-        }
-    }
-}
-
-impl PartialEq for WindowFrameBound {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl PartialOrd for WindowFrameBound {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for WindowFrameBound {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.get_rank().cmp(&other.get_rank())
-    }
-}
-
-impl Hash for WindowFrameBound {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.get_rank().hash(state)
-    }
-}
-
-impl WindowFrameBound {
-    /// get the rank of this window frame bound.
-    ///
-    /// the rank is a tuple of (u8, u64) because we'll firstly compare the kind and then the value
-    /// which requires special handling e.g. with preceding the larger the value the smaller the
-    /// rank and also for 0 preceding / following it is the same as current row
-    fn get_rank(&self) -> (u8, u64) {
-        match self {
-            WindowFrameBound::Preceding(None) => (0, 0),
-            WindowFrameBound::Following(None) => (4, 0),
-            WindowFrameBound::Preceding(Some(0))
-            | WindowFrameBound::CurrentRow
-            | WindowFrameBound::Following(Some(0)) => (2, 0),
-            WindowFrameBound::Preceding(Some(v)) => (1, u64::MAX - *v),
-            WindowFrameBound::Following(Some(v)) => (3, *v),
+            WindowFrameBound::Following(n) => {
+                if n.is_null() {
+                    f.write_str("UNBOUNDED FOLLOWING")
+                } else {
+                    write!(f, "{n} FOLLOWING")
+                }
+            }
         }
     }
 }
@@ -266,116 +305,34 @@ mod tests {
             start_bound: ast::WindowFrameBound::Following(None),
             end_bound: None,
         };
-        let result = WindowFrame::try_from(window_frame);
+        let err = WindowFrame::try_from(window_frame).unwrap_err();
         assert_eq!(
-      result.err().unwrap().to_string(),
-      "Execution error: Invalid window frame: start bound cannot be unbounded following"
-        .to_owned()
-    );
+            err.to_string(),
+            "Execution error: Invalid window frame: start bound cannot be unbounded following".to_owned()
+        );
 
         let window_frame = ast::WindowFrame {
             units: ast::WindowFrameUnits::Range,
             start_bound: ast::WindowFrameBound::Preceding(None),
             end_bound: Some(ast::WindowFrameBound::Preceding(None)),
         };
-        let result = WindowFrame::try_from(window_frame);
+        let err = WindowFrame::try_from(window_frame).unwrap_err();
         assert_eq!(
-      result.err().unwrap().to_string(),
-      "Execution error: Invalid window frame: end bound cannot be unbounded preceding"
-        .to_owned()
-    );
-
-        let window_frame = ast::WindowFrame {
-            units: ast::WindowFrameUnits::Range,
-            start_bound: ast::WindowFrameBound::Preceding(Some(1)),
-            end_bound: Some(ast::WindowFrameBound::Preceding(Some(2))),
-        };
-        let result = WindowFrame::try_from(window_frame);
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "Execution error: Invalid window frame: start bound (1 PRECEDING) cannot be larger than end bound (2 PRECEDING)".to_owned()
-        );
-
-        let window_frame = ast::WindowFrame {
-            units: ast::WindowFrameUnits::Range,
-            start_bound: ast::WindowFrameBound::Preceding(Some(2)),
-            end_bound: Some(ast::WindowFrameBound::Preceding(Some(1))),
-        };
-        let result = WindowFrame::try_from(window_frame);
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "This feature is not implemented: With WindowFrameUnits=RANGE, the bound cannot be 2 PRECEDING or FOLLOWING at the moment".to_owned()
+            err.to_string(),
+            "Execution error: Invalid window frame: end bound cannot be unbounded preceding".to_owned()
         );
 
         let window_frame = ast::WindowFrame {
             units: ast::WindowFrameUnits::Rows,
-            start_bound: ast::WindowFrameBound::Preceding(Some(2)),
-            end_bound: Some(ast::WindowFrameBound::Preceding(Some(1))),
+            start_bound: ast::WindowFrameBound::Preceding(Some(Box::new(
+                ast::Expr::Value(ast::Value::Number("2".to_string(), false)),
+            ))),
+            end_bound: Some(ast::WindowFrameBound::Preceding(Some(Box::new(
+                ast::Expr::Value(ast::Value::Number("1".to_string(), false)),
+            )))),
         };
         let result = WindowFrame::try_from(window_frame);
         assert!(result.is_ok());
         Ok(())
-    }
-
-    #[test]
-    fn test_eq() {
-        assert_eq!(
-            WindowFrameBound::Preceding(Some(0)),
-            WindowFrameBound::CurrentRow
-        );
-        assert_eq!(
-            WindowFrameBound::CurrentRow,
-            WindowFrameBound::Following(Some(0))
-        );
-        assert_eq!(
-            WindowFrameBound::Following(Some(2)),
-            WindowFrameBound::Following(Some(2))
-        );
-        assert_eq!(
-            WindowFrameBound::Following(None),
-            WindowFrameBound::Following(None)
-        );
-        assert_eq!(
-            WindowFrameBound::Preceding(Some(2)),
-            WindowFrameBound::Preceding(Some(2))
-        );
-        assert_eq!(
-            WindowFrameBound::Preceding(None),
-            WindowFrameBound::Preceding(None)
-        );
-    }
-
-    #[test]
-    fn test_ord() {
-        assert!(WindowFrameBound::Preceding(Some(1)) < WindowFrameBound::CurrentRow);
-        // ! yes this is correct!
-        assert!(
-            WindowFrameBound::Preceding(Some(2)) < WindowFrameBound::Preceding(Some(1))
-        );
-        assert!(
-            WindowFrameBound::Preceding(Some(u64::MAX))
-                < WindowFrameBound::Preceding(Some(u64::MAX - 1))
-        );
-        assert!(
-            WindowFrameBound::Preceding(None)
-                < WindowFrameBound::Preceding(Some(1000000))
-        );
-        assert!(
-            WindowFrameBound::Preceding(None)
-                < WindowFrameBound::Preceding(Some(u64::MAX))
-        );
-        assert!(WindowFrameBound::Preceding(None) < WindowFrameBound::Following(Some(0)));
-        assert!(
-            WindowFrameBound::Preceding(Some(1)) < WindowFrameBound::Following(Some(1))
-        );
-        assert!(WindowFrameBound::CurrentRow < WindowFrameBound::Following(Some(1)));
-        assert!(
-            WindowFrameBound::Following(Some(1)) < WindowFrameBound::Following(Some(2))
-        );
-        assert!(WindowFrameBound::Following(Some(2)) < WindowFrameBound::Following(None));
-        assert!(
-            WindowFrameBound::Following(Some(u64::MAX))
-                < WindowFrameBound::Following(None)
-        );
     }
 }

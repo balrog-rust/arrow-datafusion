@@ -39,12 +39,12 @@ impl PyArrowConvert for ScalarValue {
 
         // construct pyarrow array from the python value and pyarrow type
         let factory = py.import("pyarrow")?.getattr("array")?;
-        let args = PyList::new(py, &[val]);
+        let args = PyList::new(py, [val]);
         let array = factory.call1((args, typ))?;
 
         // convert the pyarrow array to rust array using C data interface
-        let array = array.extract::<ArrayData>()?;
-        let scalar = ScalarValue::try_from_array(&array.into(), 0)?;
+        let array = arrow::array::make_array(ArrayData::from_pyarrow(array)?);
+        let scalar = ScalarValue::try_from_array(&array, 0)?;
 
         Ok(scalar)
     }
@@ -52,7 +52,7 @@ impl PyArrowConvert for ScalarValue {
     fn to_pyarrow(&self, py: Python) -> PyResult<PyObject> {
         let array = self.to_array();
         // convert to pyarrow array using C data interface
-        let pyarray = array.data_ref().clone().into_py(py);
+        let pyarray = array.data().to_pyarrow(py)?;
         let pyscalar = pyarray.call_method1(py, "__getitem__", (0,))?;
 
         Ok(pyscalar)
@@ -94,14 +94,13 @@ mod tests {
                 let python_path: Vec<&str> =
                     locals.get_item("python_path").unwrap().extract().unwrap();
 
-                panic!("pyarrow not found\nExecutable: {}\nPython path: {:?}\n\
+                panic!("pyarrow not found\nExecutable: {executable}\nPython path: {python_path:?}\n\
                          HINT: try `pip install pyarrow`\n\
                          NOTE: On Mac OS, you must compile against a Framework Python \
                          (default in python.org installers and brew, but not pyenv)\n\
                          NOTE: On Mac OS, PYO3 might point to incorrect Python library \
                          path when using virtual environments. Try \
-                         `export PYTHONPATH=$(python -c \"import sys; print(sys.path[-1])\")`\n",
-                       executable, python_path)
+                         `export PYTHONPATH=$(python -c \"import sys; print(sys.path[-1])\")`\n")
             }
         })
     }

@@ -21,18 +21,16 @@ use arrow::array::{ArrayRef, Int32Array};
 use arrow::compute::SortOptions;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 
-use datafusion::logical_plan::JoinType;
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::expressions::Column;
-use datafusion::physical_plan::hash_join::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
 use datafusion::physical_plan::memory::MemoryExec;
-use datafusion::physical_plan::sort_merge_join::SortMergeJoinExec;
+use datafusion_expr::JoinType;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
-use fuzz_utils::add_empty_batches;
+use test_utils::stagger_batch_with_seed;
 
 #[tokio::test]
 async fn test_inner_join_1k() {
@@ -79,7 +77,7 @@ async fn test_semi_join_1k() {
     run_join_test(
         make_staggered_batches(10000),
         make_staggered_batches(10000),
-        JoinType::Semi,
+        JoinType::LeftSemi,
     )
     .await
 }
@@ -89,7 +87,7 @@ async fn test_anti_join_1k() {
     run_join_test(
         make_staggered_batches(10000),
         make_staggered_batches(10000),
-        JoinType::Anti,
+        JoinType::LeftAnti,
     )
     .await
 }
@@ -201,7 +199,7 @@ fn make_staggered_batches(len: usize) -> Vec<RecordBatch> {
     let input4 = Int32Array::from_iter_values(input4.into_iter());
 
     // split into several record batches
-    let mut remainder = RecordBatch::try_from_iter(vec![
+    let batch = RecordBatch::try_from_iter(vec![
         ("a", Arc::new(input1) as ArrayRef),
         ("b", Arc::new(input2) as ArrayRef),
         ("x", Arc::new(input3) as ArrayRef),
@@ -209,16 +207,6 @@ fn make_staggered_batches(len: usize) -> Vec<RecordBatch> {
     ])
     .unwrap();
 
-    let mut batches = vec![];
-
     // use a random number generator to pick a random sized output
-    let mut rng = StdRng::seed_from_u64(42);
-    while remainder.num_rows() > 0 {
-        let batch_size = rng.gen_range(0..remainder.num_rows() + 1);
-
-        batches.push(remainder.slice(0, batch_size));
-        remainder = remainder.slice(batch_size, remainder.num_rows() - batch_size);
-    }
-
-    add_empty_batches(batches, &mut rng)
+    stagger_batch_with_seed(batch, 42)
 }

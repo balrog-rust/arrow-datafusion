@@ -24,7 +24,6 @@ use datafusion::from_slice::FromSlice;
 use std::sync::Arc;
 
 use datafusion::dataframe::DataFrame;
-use datafusion::datasource::MemTable;
 
 use datafusion::error::Result;
 
@@ -35,7 +34,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::assert_batches_eq;
 use datafusion_expr::{approx_median, cast};
 
-fn create_test_table() -> Result<Arc<DataFrame>> {
+async fn create_test_table() -> Result<DataFrame> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Utf8, false),
         Field::new("b", DataType::Int32, false),
@@ -43,25 +42,23 @@ fn create_test_table() -> Result<Arc<DataFrame>> {
 
     // define data.
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        schema,
         vec![
-            Arc::new(StringArray::from_slice(&[
+            Arc::new(StringArray::from_slice([
                 "abcDEF",
                 "abc123",
                 "CBAdef",
                 "123AbcDef",
             ])),
-            Arc::new(Int32Array::from_slice(&[1, 10, 10, 100])),
+            Arc::new(Int32Array::from_slice([1, 10, 10, 100])),
         ],
     )?;
 
     let ctx = SessionContext::new();
 
-    let table = MemTable::try_new(schema, vec![vec![batch]])?;
+    ctx.register_batch("test", batch)?;
 
-    ctx.register_table("test", Arc::new(table))?;
-
-    ctx.table("test")
+    ctx.table("test").await
 }
 
 /// Excutes an expression on the test dataframe as a select.
@@ -72,8 +69,8 @@ macro_rules! assert_fn_batches {
         assert_fn_batches!($EXPR, $EXPECTED, 10)
     };
     ($EXPR:expr, $EXPECTED: expr, $LIMIT: expr) => {
-        let df = create_test_table()?;
-        let df = df.select(vec![$EXPR])?.limit(None, Some($LIMIT))?;
+        let df = create_test_table().await?;
+        let df = df.select(vec![$EXPR])?.limit(0, Some($LIMIT))?;
         let batches = df.collect().await?;
 
         assert_batches_eq!($EXPECTED, &batches);
@@ -165,7 +162,7 @@ async fn test_fn_approx_median() -> Result<()> {
         "+----------------------+",
     ];
 
-    let df = create_test_table()?;
+    let df = create_test_table().await?;
     let batches = df.aggregate(vec![], vec![expr]).unwrap().collect().await?;
 
     assert_batches_eq!(expected, &batches);
@@ -185,7 +182,7 @@ async fn test_fn_approx_percentile_cont() -> Result<()> {
         "+-------------------------------------------+",
     ];
 
-    let df = create_test_table()?;
+    let df = create_test_table().await?;
     let batches = df.aggregate(vec![], vec![expr]).unwrap().collect().await?;
 
     assert_batches_eq!(expected, &batches);
@@ -392,15 +389,10 @@ async fn test_fn_md5() -> Result<()> {
     Ok(())
 }
 
-// TODO: tobyhede - Issue #1429
-//       https://github.com/apache/arrow-datafusion/issues/1429
-//       g flag doesn't compile
 #[tokio::test]
 #[cfg(feature = "unicode_expressions")]
 async fn test_fn_regexp_match() -> Result<()> {
     let expr = regexp_match(vec![col("a"), lit("[a-z]")]);
-    // The below will fail
-    // let expr = regexp_match( vec![col("a"), lit("[a-z]"), lit("g")]);
 
     let expected = vec![
         "+-----------------------------------+",
@@ -667,14 +659,14 @@ async fn test_fn_substr() -> Result<()> {
 async fn test_cast() -> Result<()> {
     let expr = cast(col("b"), DataType::Float64);
     let expected = vec![
-        "+-------------------------+",
-        "| CAST(test.b AS Float64) |",
-        "+-------------------------+",
-        "| 1                       |",
-        "| 10                      |",
-        "| 10                      |",
-        "| 100                     |",
-        "+-------------------------+",
+        "+--------+",
+        "| test.b |",
+        "+--------+",
+        "| 1      |",
+        "| 10     |",
+        "| 10     |",
+        "| 100    |",
+        "+--------+",
     ];
 
     assert_fn_batches!(expr, expected);

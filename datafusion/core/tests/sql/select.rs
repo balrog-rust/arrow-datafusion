@@ -16,124 +16,40 @@
 // under the License.
 
 use super::*;
-use datafusion::{
-    datasource::empty::EmptyTable, from_slice::FromSlice,
-    physical_plan::collect_partitioned,
-};
+use datafusion::{datasource::empty::EmptyTable, from_slice::FromSlice};
+use datafusion_common::ScalarValue;
 use tempfile::TempDir;
-
-#[tokio::test]
-async fn all_where_empty() -> Result<()> {
-    let ctx = SessionContext::new();
-    register_aggregate_csv(&ctx).await?;
-    let sql = "SELECT *
-               FROM aggregate_test_100
-               WHERE 1=2";
-    let actual = execute_to_batches(&ctx, sql).await;
-    let expected = vec!["++", "++"];
-    assert_batches_eq!(expected, &actual);
-    Ok(())
-}
 
 #[tokio::test]
 async fn select_values_list() -> Result<()> {
     let ctx = SessionContext::new();
     {
-        let sql = "VALUES (1)";
-        let actual = execute_to_batches(&ctx, sql).await;
-        let expected = vec![
-            "+---------+",
-            "| column1 |",
-            "+---------+",
-            "| 1       |",
-            "+---------+",
-        ];
-        assert_batches_eq!(expected, &actual);
-    }
-    {
-        let sql = "VALUES (-1)";
-        let actual = execute_to_batches(&ctx, sql).await;
-        let expected = vec![
-            "+---------+",
-            "| column1 |",
-            "+---------+",
-            "| -1      |",
-            "+---------+",
-        ];
-        assert_batches_eq!(expected, &actual);
-    }
-    {
-        let sql = "VALUES (2+1,2-1,2>1)";
-        let actual = execute_to_batches(&ctx, sql).await;
-        let expected = vec![
-            "+---------+---------+---------+",
-            "| column1 | column2 | column3 |",
-            "+---------+---------+---------+",
-            "| 3       | 1       | true    |",
-            "+---------+---------+---------+",
-        ];
-        assert_batches_eq!(expected, &actual);
-    }
-    {
         let sql = "VALUES";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
+        ctx.sql(sql).await.unwrap_err();
     }
     {
         let sql = "VALUES ()";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
-    }
-    {
-        let sql = "VALUES (1),(2)";
-        let actual = execute_to_batches(&ctx, sql).await;
-        let expected = vec![
-            "+---------+",
-            "| column1 |",
-            "+---------+",
-            "| 1       |",
-            "| 2       |",
-            "+---------+",
-        ];
-        assert_batches_eq!(expected, &actual);
+        ctx.sql(sql).await.unwrap_err();
     }
     {
         let sql = "VALUES (1),()";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
-    }
-    {
-        let sql = "VALUES (1,'a'),(2,'b')";
-        let actual = execute_to_batches(&ctx, sql).await;
-        let expected = vec![
-            "+---------+---------+",
-            "| column1 | column2 |",
-            "+---------+---------+",
-            "| 1       | a       |",
-            "| 2       | b       |",
-            "+---------+---------+",
-        ];
-        assert_batches_eq!(expected, &actual);
+        ctx.sql(sql).await.unwrap_err();
     }
     {
         let sql = "VALUES (1),(1,2)";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
+        ctx.sql(sql).await.unwrap_err();
     }
     {
         let sql = "VALUES (1),('2')";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
+        ctx.sql(sql).await.unwrap_err();
     }
     {
         let sql = "VALUES (1),(2.0)";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
+        ctx.sql(sql).await.unwrap_err();
     }
     {
         let sql = "VALUES (1,2), (1,'2')";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
+        ctx.sql(sql).await.unwrap_err();
     }
     {
         let sql = "VALUES (1,'a'),(NULL,'b'),(3,'c')";
@@ -241,6 +157,34 @@ async fn select_values_list() -> Result<()> {
             "| physical_plan | ValuesExec                                                                                                |",
             "|               |                                                                                                           |",
             "+---------------+-----------------------------------------------------------------------------------------------------------+",
+        ];
+        assert_batches_eq!(expected, &actual);
+    }
+    {
+        let sql = "EXPLAIN VALUES ('1'::float)";
+        let actual = execute_to_batches(&ctx, sql).await;
+        let expected = vec![
+            "+---------------+-----------------------------------+",
+            "| plan_type     | plan                              |",
+            "+---------------+-----------------------------------+",
+            "| logical_plan  | Values: (Float32(1) AS Utf8(\"1\")) |",
+            "| physical_plan | ValuesExec                        |",
+            "|               |                                   |",
+            "+---------------+-----------------------------------+",
+        ];
+        assert_batches_eq!(expected, &actual);
+    }
+    {
+        let sql = "EXPLAIN VALUES (('1'||'2')::int unsigned)";
+        let actual = execute_to_batches(&ctx, sql).await;
+        let expected = vec![
+            "+---------------+------------------------------------------------+",
+            "| plan_type     | plan                                           |",
+            "+---------------+------------------------------------------------+",
+            "| logical_plan  | Values: (UInt32(12) AS Utf8(\"1\") || Utf8(\"2\")) |",
+            "| physical_plan | ValuesExec                                     |",
+            "|               |                                                |",
+            "+---------------+------------------------------------------------+",
         ];
         assert_batches_eq!(expected, &actual);
     }
@@ -469,23 +413,22 @@ async fn use_between_expression_in_select_query() -> Result<()> {
     ];
     assert_batches_eq!(expected, &actual);
 
-    let input = Int64Array::from_slice(&[1, 2, 3, 4]);
+    let input = Int64Array::from_slice([1, 2, 3, 4]);
     let batch = RecordBatch::try_from_iter(vec![("c1", Arc::new(input) as _)]).unwrap();
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", batch)?;
 
     let sql = "SELECT abs(c1) BETWEEN 0 AND LoG(c1 * 100 ) FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     // Expect field name to be correctly converted for expr, low and high.
     let expected = vec![
-        "+--------------------------------------------------------------------+",
-        "| abs(test.c1) BETWEEN Int64(0) AND log(test.c1 Multiply Int64(100)) |",
-        "+--------------------------------------------------------------------+",
-        "| true                                                               |",
-        "| true                                                               |",
-        "| false                                                              |",
-        "| false                                                              |",
-        "+--------------------------------------------------------------------+",
+        "+-------------------------------------------------------------+",
+        "| abs(test.c1) BETWEEN Int64(0) AND log(test.c1 * Int64(100)) |",
+        "+-------------------------------------------------------------+",
+        "| true                                                        |",
+        "| true                                                        |",
+        "| false                                                       |",
+        "| false                                                       |",
+        "+-------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
 
@@ -495,12 +438,11 @@ async fn use_between_expression_in_select_query() -> Result<()> {
         .unwrap()
         .to_string();
 
-    // Only test that the projection exprs arecorrect, rather than entire output
+    // Only test that the projection exprs are correct, rather than entire output
     let needle = "ProjectionExec: expr=[c1@0 >= 2 AND c1@0 <= 3 as test.c1 BETWEEN Int64(2) AND Int64(3)]";
     assert_contains!(&formatted, needle);
-    let needle = "Projection: #test.c1 BETWEEN Int64(2) AND Int64(3)";
+    let needle = "Projection: test.c1 >= Int64(2) AND test.c1 <= Int64(3)";
     assert_contains!(&formatted, needle);
-
     Ok(())
 }
 
@@ -512,7 +454,7 @@ async fn query_get_indexed_field() -> Result<()> {
         DataType::List(Box::new(Field::new("item", DataType::Int64, true))),
         false,
     )]));
-    let builder = PrimitiveBuilder::<Int64Type>::new(3);
+    let builder = PrimitiveBuilder::<Int64Type>::with_capacity(3);
     let mut lb = ListBuilder::new(builder);
     for int_vec in vec![vec![0, 1, 2], vec![4, 5, 6], vec![7, 8, 9]] {
         let builder = lb.values();
@@ -523,10 +465,8 @@ async fn query_get_indexed_field() -> Result<()> {
     }
 
     let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(lb.finish())])?;
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-    let table_a = Arc::new(table);
 
-    ctx.register_table("ints", table_a)?;
+    ctx.register_batch("ints", data)?;
 
     // Original column is micros, convert to millis and check timestamp
     let sql = "SELECT some_list[1] as i0 FROM ints LIMIT 3";
@@ -556,7 +496,7 @@ async fn query_nested_get_indexed_field() -> Result<()> {
         false,
     )]));
 
-    let builder = PrimitiveBuilder::<Int64Type>::new(3);
+    let builder = PrimitiveBuilder::<Int64Type>::with_capacity(3);
     let nested_lb = ListBuilder::new(builder);
     let mut lb = ListBuilder::new(nested_lb);
     for int_vec_vec in vec![
@@ -576,10 +516,8 @@ async fn query_nested_get_indexed_field() -> Result<()> {
     }
 
     let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(lb.finish())])?;
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-    let table_a = Arc::new(table);
 
-    ctx.register_table("ints", table_a)?;
+    ctx.register_batch("ints", data)?;
 
     // Original column is micros, convert to millis and check timestamp
     let sql = "SELECT some_list[1] as i0 FROM ints LIMIT 3";
@@ -622,7 +560,7 @@ async fn query_nested_get_indexed_field_on_struct() -> Result<()> {
         false,
     )]));
 
-    let builder = PrimitiveBuilder::<Int64Type>::new(3);
+    let builder = PrimitiveBuilder::<Int64Type>::with_capacity(3);
     let nested_lb = ListBuilder::new(builder);
     let mut sb = StructBuilder::new(struct_fields, vec![Box::new(nested_lb)]);
     for int_vec in vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]] {
@@ -631,12 +569,12 @@ async fn query_nested_get_indexed_field_on_struct() -> Result<()> {
             lb.values().append_value(int);
         }
         lb.append(true);
+        sb.append(true);
     }
-    let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(sb.finish())])?;
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-    let table_a = Arc::new(table);
+    let s = sb.finish();
+    let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(s)])?;
 
-    ctx.register_table("structs", table_a)?;
+    ctx.register_batch("structs", data)?;
 
     // Original column is micros, convert to millis and check timestamp
     let sql = "SELECT some_struct['bar'] as l0 FROM structs LIMIT 3";
@@ -683,6 +621,7 @@ async fn query_nested_get_indexed_field_on_struct() -> Result<()> {
 }
 
 #[tokio::test]
+#[cfg(feature = "dictionary_expressions")]
 async fn query_on_string_dictionary() -> Result<()> {
     // Test to ensure DataFusion can operate on dictionary types
     // Use StringDictionary (32 bit indexes = keys)
@@ -702,9 +641,8 @@ async fn query_on_string_dictionary() -> Result<()> {
     ])
     .unwrap();
 
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", batch)?;
 
     // Basic SELECT
     let sql = "SELECT d1 FROM test";
@@ -872,19 +810,277 @@ async fn query_on_string_dictionary() -> Result<()> {
     assert_batches_sorted_eq!(expected, &actual);
 
     // window functions
-    let sql = "SELECT d1, row_number() OVER (partition by d1) FROM test";
+    let sql = "SELECT d1, row_number() OVER (partition by d1) as rn1 FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+-------+--------------+",
-        "| d1    | ROW_NUMBER() |",
-        "+-------+--------------+",
-        "|       | 1            |",
-        "| one   | 1            |",
-        "| three | 1            |",
-        "+-------+--------------+",
+        "+-------+-----+",
+        "| d1    | rn1 |",
+        "+-------+-----+",
+        "|       | 1   |",
+        "| one   | 1   |",
+        "| three | 1   |",
+        "+-------+-----+",
     ];
     assert_batches_sorted_eq!(expected, &actual);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn sort_on_window_null_string() -> Result<()> {
+    let d1: DictionaryArray<Int32Type> =
+        vec![Some("one"), None, Some("three")].into_iter().collect();
+    let d2: StringArray = vec![Some("ONE"), None, Some("THREE")].into_iter().collect();
+    let d3: LargeStringArray =
+        vec![Some("One"), None, Some("Three")].into_iter().collect();
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("d1", Arc::new(d1) as ArrayRef),
+        ("d2", Arc::new(d2) as ArrayRef),
+        ("d3", Arc::new(d3) as ArrayRef),
+    ])
+    .unwrap();
+
+    let ctx = SessionContext::with_config(SessionConfig::new().with_target_partitions(2));
+    ctx.register_batch("test", batch)?;
+
+    let sql =
+        "SELECT d1, row_number() OVER (partition by d1) as rn1 FROM test order by d1 asc";
+
+    let actual = execute_to_batches(&ctx, sql).await;
+    // NULLS LAST
+    let expected = vec![
+        "+-------+-----+",
+        "| d1    | rn1 |",
+        "+-------+-----+",
+        "| one   | 1   |",
+        "| three | 1   |",
+        "|       | 1   |",
+        "+-------+-----+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT d2, row_number() OVER (partition by d2) as rn1 FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
+    // NULLS LAST
+    let expected = vec![
+        "+-------+-----+",
+        "| d2    | rn1 |",
+        "+-------+-----+",
+        "| ONE   | 1   |",
+        "| THREE | 1   |",
+        "|       | 1   |",
+        "+-------+-----+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    let sql =
+        "SELECT d2, row_number() OVER (partition by d2 order by d2 desc) as rn1 FROM test";
+
+    let actual = execute_to_batches(&ctx, sql).await;
+    // NULLS FIRST
+    let expected = vec![
+        "+-------+-----+",
+        "| d2    | rn1 |",
+        "+-------+-----+",
+        "|       | 1   |",
+        "| THREE | 1   |",
+        "| ONE   | 1   |",
+        "+-------+-----+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    // FIXME sort on LargeUtf8 String has bug.
+    // let sql =
+    //     "SELECT d3, row_number() OVER (partition by d3) as rn1 FROM test";
+    // let actual = execute_to_batches(&ctx, sql).await;
+    // let expected = vec![
+    //     "+-------+-----+",
+    //     "| d3    | rn1 |",
+    //     "+-------+-----+",
+    //     "|       | 1   |",
+    //     "| One   | 1   |",
+    //     "| Three | 1   |",
+    //     "+-------+-----+",
+    // ];
+    // assert_batches_eq!(expected, &actual);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn filter_with_time32second() -> Result<()> {
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("time", DataType::Time32(TimeUnit::Second), false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Time32SecondArray::from(vec![
+                Some(5_000),
+                Some(5_000),
+                Some(5_500),
+                Some(5_500),
+                Some(5_900),
+                Some(5_900),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(2505),
+                Some(2436),
+                Some(2384),
+                Some(1815),
+                Some(2330),
+                Some(2065),
+            ])),
+        ],
+    )?;
+
+    ctx.register_batch("temporal", data)?;
+    let sql = "SELECT value FROM temporal WHERE time = '01:23:20'";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| value |",
+        "+-------+",
+        "| 2436  |",
+        "| 2505  |",
+        "+-------+",
+    ];
+    assert_batches_sorted_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn filter_with_time32millisecond() -> Result<()> {
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("time", DataType::Time32(TimeUnit::Millisecond), false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Time32MillisecondArray::from(vec![
+                Some(5_000_000),
+                Some(5_000_000),
+                Some(5_500_000),
+                Some(5_500_000),
+                Some(5_900_000),
+                Some(5_900_000),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(2505),
+                Some(2436),
+                Some(2384),
+                Some(1815),
+                Some(2330),
+                Some(2065),
+            ])),
+        ],
+    )?;
+
+    ctx.register_batch("temporal", data)?;
+    let sql = "SELECT value FROM temporal WHERE time = '01:23:20'";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| value |",
+        "+-------+",
+        "| 2436  |",
+        "| 2505  |",
+        "+-------+",
+    ];
+    assert_batches_sorted_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn filter_with_time64microsecond() -> Result<()> {
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("time", DataType::Time64(TimeUnit::Microsecond), false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(5_000_000_000),
+                Some(5_000_000_000),
+                Some(5_500_000_000),
+                Some(5_500_000_000),
+                Some(5_900_000_000),
+                Some(5_900_000_000),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(2505),
+                Some(2436),
+                Some(2384),
+                Some(1815),
+                Some(2330),
+                Some(2065),
+            ])),
+        ],
+    )?;
+
+    ctx.register_batch("temporal", data)?;
+    let sql = "SELECT value FROM temporal WHERE time = '01:23:20'";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| value |",
+        "+-------+",
+        "| 2436  |",
+        "| 2505  |",
+        "+-------+",
+    ];
+    assert_batches_sorted_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn filter_with_time64nanosecond() -> Result<()> {
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("time", DataType::Time64(TimeUnit::Nanosecond), false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Time64NanosecondArray::from(vec![
+                Some(5_000_000_000_000),
+                Some(5_000_000_000_000),
+                Some(5_500_000_000_000),
+                Some(5_500_000_000_000),
+                Some(5_900_000_000_000),
+                Some(5_900_000_000_000),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(2505),
+                Some(2436),
+                Some(2384),
+                Some(1815),
+                Some(2330),
+                Some(2065),
+            ])),
+        ],
+    )?;
+
+    ctx.register_batch("temporal", data)?;
+    let sql = "SELECT value FROM temporal WHERE time = '01:23:20'";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| value |",
+        "+-------+",
+        "| 2436  |",
+        "| 2505  |",
+        "+-------+",
+    ];
+    assert_batches_sorted_eq!(expected, &actual);
     Ok(())
 }
 
@@ -1060,31 +1256,65 @@ async fn csv_join_unaliased_subqueries() -> Result<()> {
     Ok(())
 }
 
+// Test prepare statement from sql to final result
+// This test is equivalent with the test parallel_query_with_filter below but using prepare statement
+#[tokio::test]
+async fn test_prepare_statement() -> Result<()> {
+    let tmp_dir = TempDir::new()?;
+    let partition_count = 4;
+    let ctx = partitioned_csv::create_ctx(&tmp_dir, partition_count).await?;
+
+    // sql to statement then to prepare logical plan with parameters
+    // c1 defined as UINT32, c2 defined as UInt64 but the params are Int32 and Float64
+    let dataframe =
+        ctx.sql("PREPARE my_plan(INT, DOUBLE) AS SELECT c1, c2 FROM test WHERE c1 > $2 AND c1 < $1").await?;
+
+    // prepare logical plan to logical plan without parameters
+    let param_values = vec![ScalarValue::Int32(Some(3)), ScalarValue::Float64(Some(0.0))];
+    let dataframe = dataframe.with_param_values(param_values)?;
+    let results = dataframe.collect().await?;
+
+    let expected = vec![
+        "+----+----+",
+        "| c1 | c2 |",
+        "+----+----+",
+        "| 1  | 1  |",
+        "| 1  | 10 |",
+        "| 1  | 2  |",
+        "| 1  | 3  |",
+        "| 1  | 4  |",
+        "| 1  | 5  |",
+        "| 1  | 6  |",
+        "| 1  | 7  |",
+        "| 1  | 8  |",
+        "| 1  | 9  |",
+        "| 2  | 1  |",
+        "| 2  | 10 |",
+        "| 2  | 2  |",
+        "| 2  | 3  |",
+        "| 2  | 4  |",
+        "| 2  | 5  |",
+        "| 2  | 6  |",
+        "| 2  | 7  |",
+        "| 2  | 8  |",
+        "| 2  | 9  |",
+        "+----+----+",
+    ];
+    assert_batches_sorted_eq!(expected, &results);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn parallel_query_with_filter() -> Result<()> {
     let tmp_dir = TempDir::new()?;
     let partition_count = 4;
     let ctx = partitioned_csv::create_ctx(&tmp_dir, partition_count).await?;
 
-    let logical_plan =
-        ctx.create_logical_plan("SELECT c1, c2 FROM test WHERE c1 > 0 AND c1 < 3")?;
-    let logical_plan = ctx.optimize(&logical_plan)?;
-
-    let physical_plan = ctx.create_physical_plan(&logical_plan).await?;
-
-    let task_ctx = ctx.task_ctx();
-    let results = collect_partitioned(physical_plan, task_ctx).await?;
-
-    // note that the order of partitions is not deterministic
-    let mut num_rows = 0;
-    for partition in &results {
-        for batch in partition {
-            num_rows += batch.num_rows();
-        }
-    }
-    assert_eq!(20, num_rows);
-
-    let results: Vec<RecordBatch> = results.into_iter().flatten().collect();
+    let dataframe = ctx
+        .sql("SELECT c1, c2 FROM test WHERE c1 > 0 AND c1 < 3")
+        .await?;
+    let results = dataframe.collect().await.unwrap();
     let expected = vec![
         "+----+----+",
         "| c1 | c2 |",
@@ -1126,8 +1356,7 @@ async fn query_with_filter_string_type_coercion() {
             .unwrap();
 
     let ctx = SessionContext::new();
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
-    ctx.register_table("t", Arc::new(table)).unwrap();
+    ctx.register_batch("t", batch).unwrap();
     let sql = "select * from t where large_string = '1'";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
@@ -1191,22 +1420,27 @@ async fn boolean_literal() -> Result<()> {
 
 #[tokio::test]
 async fn unprojected_filter() {
-    let ctx = SessionContext::new();
+    let config = SessionConfig::new();
+    let ctx = SessionContext::with_config(config);
     let df = ctx.read_table(table_with_sequence(1, 3).unwrap()).unwrap();
 
     let df = df
-        .select(vec![col("i") + col("i")])
-        .unwrap()
         .filter(col("i").gt(lit(2)))
+        .unwrap()
+        .select(vec![col("i") + col("i")])
         .unwrap();
+
+    let plan = df.clone().into_optimized_plan().unwrap();
+    println!("{}", plan.display_indent());
+
     let results = df.collect().await.unwrap();
 
     let expected = vec![
-        "+--------------------------+",
-        "| ?table?.i Plus ?table?.i |",
-        "+--------------------------+",
-        "| 6                        |",
-        "+--------------------------+",
+        "+-----------------------+",
+        "| ?table?.i + ?table?.i |",
+        "+-----------------------+",
+        "| 6                     |",
+        "+-----------------------+",
     ];
     assert_batches_sorted_eq!(expected, &results);
 }
@@ -1219,13 +1453,11 @@ async fn case_sensitive_in_default_dialect() {
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(int32_array)]).unwrap();
 
     let ctx = SessionContext::new();
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
-    ctx.register_table("t", Arc::new(table)).unwrap();
+    ctx.register_batch("t", batch).unwrap();
 
     {
         let sql = "select \"int32\" from t";
-        let plan = ctx.create_logical_plan(sql);
-        assert!(plan.is_err());
+        ctx.sql(sql).await.unwrap_err();
     }
 
     {

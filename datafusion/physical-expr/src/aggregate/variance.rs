@@ -30,9 +30,10 @@ use arrow::{
     datatypes::DataType,
     datatypes::Field,
 };
+use datafusion_common::downcast_value;
 use datafusion_common::ScalarValue;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_expr::{Accumulator, AggregateState};
+use datafusion_expr::Accumulator;
 
 /// VAR and VAR_SAMP aggregate expression
 #[derive(Debug)]
@@ -78,23 +79,23 @@ impl AggregateExpr for Variance {
         Ok(Box::new(VarianceAccumulator::try_new(StatsType::Sample)?))
     }
 
+    fn create_sliding_accumulator(&self) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(VarianceAccumulator::try_new(StatsType::Sample)?))
+    }
+
     fn state_fields(&self) -> Result<Vec<Field>> {
         Ok(vec![
             Field::new(
-                &format_state_name(&self.name, "count"),
+                format_state_name(&self.name, "count"),
                 DataType::UInt64,
                 true,
             ),
             Field::new(
-                &format_state_name(&self.name, "mean"),
+                format_state_name(&self.name, "mean"),
                 DataType::Float64,
                 true,
             ),
-            Field::new(
-                &format_state_name(&self.name, "m2"),
-                DataType::Float64,
-                true,
-            ),
+            Field::new(format_state_name(&self.name, "m2"), DataType::Float64, true),
         ])
     }
 
@@ -139,23 +140,25 @@ impl AggregateExpr for VariancePop {
         )?))
     }
 
+    fn create_sliding_accumulator(&self) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(VarianceAccumulator::try_new(
+            StatsType::Population,
+        )?))
+    }
+
     fn state_fields(&self) -> Result<Vec<Field>> {
         Ok(vec![
             Field::new(
-                &format_state_name(&self.name, "count"),
+                format_state_name(&self.name, "count"),
                 DataType::UInt64,
                 true,
             ),
             Field::new(
-                &format_state_name(&self.name, "mean"),
+                format_state_name(&self.name, "mean"),
                 DataType::Float64,
                 true,
             ),
-            Field::new(
-                &format_state_name(&self.name, "m2"),
-                DataType::Float64,
-                true,
-            ),
+            Field::new(format_state_name(&self.name, "m2"), DataType::Float64, true),
         ])
     }
 
@@ -210,22 +213,17 @@ impl VarianceAccumulator {
 }
 
 impl Accumulator for VarianceAccumulator {
-    fn state(&self) -> Result<Vec<AggregateState>> {
+    fn state(&self) -> Result<Vec<ScalarValue>> {
         Ok(vec![
-            AggregateState::Scalar(ScalarValue::from(self.count)),
-            AggregateState::Scalar(ScalarValue::from(self.mean)),
-            AggregateState::Scalar(ScalarValue::from(self.m2)),
+            ScalarValue::from(self.count),
+            ScalarValue::from(self.mean),
+            ScalarValue::from(self.m2),
         ])
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let values = &cast(&values[0], &DataType::Float64)?;
-        let arr = values
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .iter()
-            .flatten();
+        let arr = downcast_value!(values, Float64Array).iter().flatten();
 
         for value in arr {
             let new_count = self.count + 1;
@@ -242,10 +240,29 @@ impl Accumulator for VarianceAccumulator {
         Ok(())
     }
 
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let values = &cast(&values[0], &DataType::Float64)?;
+        let arr = downcast_value!(values, Float64Array).iter().flatten();
+
+        for value in arr {
+            let new_count = self.count - 1;
+            let delta1 = self.mean - value;
+            let new_mean = delta1 / new_count as f64 + self.mean;
+            let delta2 = new_mean - value;
+            let new_m2 = self.m2 - delta1 * delta2;
+
+            self.count -= 1;
+            self.mean = new_mean;
+            self.m2 = new_m2;
+        }
+
+        Ok(())
+    }
+
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let counts = states[0].as_any().downcast_ref::<UInt64Array>().unwrap();
-        let means = states[1].as_any().downcast_ref::<Float64Array>().unwrap();
-        let m2s = states[2].as_any().downcast_ref::<Float64Array>().unwrap();
+        let counts = downcast_value!(states[0], UInt64Array);
+        let means = downcast_value!(states[1], Float64Array);
+        let m2s = downcast_value!(states[2], Float64Array);
 
         for i in 0..counts.len() {
             let c = counts.value(i);
@@ -279,17 +296,21 @@ impl Accumulator for VarianceAccumulator {
             }
         };
 
-        if count <= 1 {
-            return Err(DataFusionError::Internal(
-                "At least two values are needed to calculate variance".to_string(),
-            ));
-        }
+        Ok(ScalarValue::Float64(match self.count {
+            0 => None,
+            1 => {
+                if let StatsType::Population = self.stats_type {
+                    Some(0.0)
+                } else {
+                    None
+                }
+            }
+            _ => Some(self.m2 / count as f64),
+        }))
+    }
 
-        if self.count == 0 {
-            Ok(ScalarValue::Float64(None))
-        } else {
-            Ok(ScalarValue::Float64(Some(self.m2 / count as f64)))
-        }
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
     }
 }
 
@@ -311,8 +332,7 @@ mod tests {
             a,
             DataType::Float64,
             VariancePop,
-            ScalarValue::from(0.25_f64),
-            DataType::Float64
+            ScalarValue::from(0.25_f64)
         )
     }
 
@@ -320,26 +340,14 @@ mod tests {
     fn variance_f64_2() -> Result<()> {
         let a: ArrayRef =
             Arc::new(Float64Array::from(vec![1_f64, 2_f64, 3_f64, 4_f64, 5_f64]));
-        generic_test_op!(
-            a,
-            DataType::Float64,
-            VariancePop,
-            ScalarValue::from(2_f64),
-            DataType::Float64
-        )
+        generic_test_op!(a, DataType::Float64, VariancePop, ScalarValue::from(2_f64))
     }
 
     #[test]
     fn variance_f64_3() -> Result<()> {
         let a: ArrayRef =
             Arc::new(Float64Array::from(vec![1_f64, 2_f64, 3_f64, 4_f64, 5_f64]));
-        generic_test_op!(
-            a,
-            DataType::Float64,
-            Variance,
-            ScalarValue::from(2.5_f64),
-            DataType::Float64
-        )
+        generic_test_op!(a, DataType::Float64, Variance, ScalarValue::from(2.5_f64))
     }
 
     #[test]
@@ -349,47 +357,28 @@ mod tests {
             a,
             DataType::Float64,
             Variance,
-            ScalarValue::from(0.9033333333333333_f64),
-            DataType::Float64
+            ScalarValue::from(0.9033333333333333_f64)
         )
     }
 
     #[test]
     fn variance_i32() -> Result<()> {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
-        generic_test_op!(
-            a,
-            DataType::Int32,
-            VariancePop,
-            ScalarValue::from(2_f64),
-            DataType::Float64
-        )
+        generic_test_op!(a, DataType::Int32, VariancePop, ScalarValue::from(2_f64))
     }
 
     #[test]
     fn variance_u32() -> Result<()> {
         let a: ArrayRef =
             Arc::new(UInt32Array::from(vec![1_u32, 2_u32, 3_u32, 4_u32, 5_u32]));
-        generic_test_op!(
-            a,
-            DataType::UInt32,
-            VariancePop,
-            ScalarValue::from(2.0f64),
-            DataType::Float64
-        )
+        generic_test_op!(a, DataType::UInt32, VariancePop, ScalarValue::from(2.0f64))
     }
 
     #[test]
     fn variance_f32() -> Result<()> {
         let a: ArrayRef =
             Arc::new(Float32Array::from(vec![1_f32, 2_f32, 3_f32, 4_f32, 5_f32]));
-        generic_test_op!(
-            a,
-            DataType::Float32,
-            VariancePop,
-            ScalarValue::from(2_f64),
-            DataType::Float64
-        )
+        generic_test_op!(a, DataType::Float32, VariancePop, ScalarValue::from(2_f64))
     }
 
     #[test]
@@ -403,8 +392,8 @@ mod tests {
             "bla".to_string(),
             DataType::Float64,
         ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
+        let actual = aggregate(&batch, agg).unwrap();
+        assert_eq!(actual, ScalarValue::Float64(None));
 
         Ok(())
     }
@@ -422,8 +411,7 @@ mod tests {
             a,
             DataType::Int32,
             VariancePop,
-            ScalarValue::from(2.1875f64),
-            DataType::Float64
+            ScalarValue::from(2.1875_f64)
         )
     }
 
@@ -438,8 +426,8 @@ mod tests {
             "bla".to_string(),
             DataType::Float64,
         ));
-        let actual = aggregate(&batch, agg);
-        assert!(actual.is_err());
+        let actual = aggregate(&batch, agg).unwrap();
+        assert_eq!(actual, ScalarValue::Float64(None));
 
         Ok(())
     }

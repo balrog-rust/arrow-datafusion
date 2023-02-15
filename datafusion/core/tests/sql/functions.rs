@@ -19,7 +19,7 @@ use super::*;
 
 #[tokio::test]
 async fn sqrt_f32_vs_f64() -> Result<()> {
-    let ctx = create_ctx()?;
+    let ctx = create_ctx();
     register_aggregate_csv(&ctx).await?;
     // sqrt(f32)'s plan passes
     let sql = "SELECT avg(sqrt(c11)) FROM aggregate_test_100";
@@ -43,12 +43,12 @@ async fn csv_query_cast() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
 
     let expected = vec![
-        "+-----------------------------------------+",
-        "| CAST(aggregate_test_100.c12 AS Float32) |",
-        "+-----------------------------------------+",
-        "| 0.39144436                              |",
-        "| 0.3887028                               |",
-        "+-----------------------------------------+",
+        "+------------------------+",
+        "| aggregate_test_100.c12 |",
+        "+------------------------+",
+        "| 0.39144436             |",
+        "| 0.3887028              |",
+        "+------------------------+",
     ];
 
     assert_batches_eq!(expected, &actual);
@@ -64,12 +64,12 @@ async fn csv_query_cast_literal() -> Result<()> {
     let actual = execute_to_batches(&ctx, sql).await;
 
     let expected = vec![
-        "+--------------------+---------------------------+",
-        "| c12                | CAST(Int64(1) AS Float32) |",
-        "+--------------------+---------------------------+",
-        "| 0.9294097332465232 | 1                         |",
-        "| 0.3114712539863804 | 1                         |",
-        "+--------------------+---------------------------+",
+        "+--------------------+----------+",
+        "| c12                | Int64(1) |",
+        "+--------------------+----------+",
+        "| 0.9294097332465232 | 1        |",
+        "| 0.3114712539863804 | 1        |",
+        "+--------------------+----------+",
     ];
 
     assert_batches_eq!(expected, &actual);
@@ -86,32 +86,29 @@ async fn query_concat() -> Result<()> {
     let data = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(StringArray::from_slice(&["", "a", "aa", "aaa"])),
+            Arc::new(StringArray::from_slice(["", "a", "aa", "aaa"])),
             Arc::new(Int32Array::from(vec![Some(0), Some(1), None, Some(3)])),
         ],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT concat(c1, '-hi-', cast(c2 as varchar)) FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+----------------------------------------------------+",
-        "| concat(test.c1,Utf8(\"-hi-\"),CAST(test.c2 AS Utf8)) |",
-        "+----------------------------------------------------+",
-        "| -hi-0                                              |",
-        "| a-hi-1                                             |",
-        "| aa-hi-                                             |",
-        "| aaa-hi-3                                           |",
-        "+----------------------------------------------------+",
+        "+--------------------------------------+",
+        "| concat(test.c1,Utf8(\"-hi-\"),test.c2) |",
+        "+--------------------------------------+",
+        "| -hi-0                                |",
+        "| a-hi-1                               |",
+        "| aa-hi-                               |",
+        "| aaa-hi-3                             |",
+        "+--------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
 }
 
-// Revisit after implementing https://github.com/apache/arrow-rs/issues/925
 #[tokio::test]
 async fn query_array() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![
@@ -122,24 +119,26 @@ async fn query_array() -> Result<()> {
     let data = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(StringArray::from_slice(&["", "a", "aa", "aaa"])),
+            Arc::new(StringArray::from_slice(["", "a", "aa", "aaa"])),
             Arc::new(Int32Array::from(vec![Some(0), Some(1), None, Some(3)])),
         ],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
-    let sql = "SELECT array(c1, cast(c2 as varchar)) FROM test";
-    let actual = execute(&ctx, sql).await;
+    ctx.register_batch("test", data)?;
+    let sql = "SELECT make_array(c1, cast(c2 as varchar)) FROM test";
+    let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        vec!["[,0]"],
-        vec!["[a,1]"],
-        vec!["[aa,NULL]"],
-        vec!["[aaa,3]"],
+        "+----------------------------+",
+        "| makearray(test.c1,test.c2) |",
+        "+----------------------------+",
+        "| [, 0]                      |",
+        "| [a, 1]                     |",
+        "| [aa, ]                     |",
+        "| [aaa, 3]                   |",
+        "+----------------------------+",
     ];
-    assert_eq!(expected, actual);
+    assert_batches_eq!(expected, &actual);
     Ok(())
 }
 
@@ -147,10 +146,16 @@ async fn query_array() -> Result<()> {
 async fn query_array_scalar() -> Result<()> {
     let ctx = SessionContext::new();
 
-    let sql = "SELECT array(1, 2, 3);";
-    let actual = execute(&ctx, sql).await;
-    let expected = vec![vec!["[1, 2, 3]"]];
-    assert_eq!(expected, actual);
+    let sql = "SELECT make_array(1, 2, 3);";
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+---------------------------------------+",
+        "| makearray(Int64(1),Int64(2),Int64(3)) |",
+        "+---------------------------------------+",
+        "| [1, 2, 3]                             |",
+        "+---------------------------------------+",
+    ];
+    assert_batches_eq!(expected, &actual);
     Ok(())
 }
 
@@ -207,10 +212,8 @@ async fn coalesce_result() -> Result<()> {
         ],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT COALESCE(c1, c2) FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
@@ -249,10 +252,8 @@ async fn coalesce_result_with_default_value() -> Result<()> {
         ],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT COALESCE(c1, c2, '-1') FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
@@ -285,10 +286,8 @@ async fn coalesce_sum_with_default_value() -> Result<()> {
         ],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT SUM(COALESCE(c1, c2, 0)) FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
@@ -317,21 +316,19 @@ async fn coalesce_mul_with_default_value() -> Result<()> {
         ],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = "SELECT COALESCE(c1 * c2, 0) FROM test";
     let actual = execute_to_batches(&ctx, sql).await;
     let expected = vec![
-        "+---------------------------------------------+",
-        "| coalesce(test.c1 Multiply test.c2,Int64(0)) |",
-        "+---------------------------------------------+",
-        "| 2                                           |",
-        "| 0                                           |",
-        "| 0                                           |",
-        "| 0                                           |",
-        "+---------------------------------------------+",
+        "+--------------------------------------+",
+        "| coalesce(test.c1 * test.c2,Int64(0)) |",
+        "+--------------------------------------+",
+        "| 2                                    |",
+        "| 0                                    |",
+        "| 0                                    |",
+        "| 0                                    |",
+        "+--------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -384,43 +381,43 @@ async fn case_builtin_math_expression() {
     let type_values = vec![
         (
             DataType::Int8,
-            Arc::new(Int8Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(Int8Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::Int16,
-            Arc::new(Int16Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(Int16Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::Int32,
-            Arc::new(Int32Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(Int32Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::Int64,
-            Arc::new(Int64Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(Int64Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::UInt8,
-            Arc::new(UInt8Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(UInt8Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::UInt16,
-            Arc::new(UInt16Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(UInt16Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::UInt32,
-            Arc::new(UInt32Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(UInt32Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::UInt64,
-            Arc::new(UInt64Array::from_slice(&[1])) as ArrayRef,
+            Arc::new(UInt64Array::from_slice([1])) as ArrayRef,
         ),
         (
             DataType::Float32,
-            Arc::new(Float32Array::from_slice(&[1.0_f32])) as ArrayRef,
+            Arc::new(Float32Array::from_slice([1.0_f32])) as ArrayRef,
         ),
         (
             DataType::Float64,
-            Arc::new(Float64Array::from_slice(&[1.0_f64])) as ArrayRef,
+            Arc::new(Float64Array::from_slice([1.0_f64])) as ArrayRef,
         ),
     ];
 
@@ -428,9 +425,8 @@ async fn case_builtin_math_expression() {
         let schema =
             Arc::new(Schema::new(vec![Field::new("v", data_type.clone(), false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
-        let provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.deregister_table("t").unwrap();
-        ctx.register_table("t", Arc::new(provider)).unwrap();
+        ctx.register_batch("t", batch).unwrap();
         let expected = vec![
             "+-----------+",
             "| sqrt(t.v) |",
@@ -489,10 +485,8 @@ async fn test_power() -> Result<()> {
         ],
     )?;
 
-    let table = MemTable::try_new(schema, vec![vec![data]])?;
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table))?;
+    ctx.register_batch("test", data)?;
     let sql = r"SELECT power(i32, exp_i) as power_i32,
                  power(i64, exp_f) as power_i64,
                  pow(f32, exp_i) as power_f32,

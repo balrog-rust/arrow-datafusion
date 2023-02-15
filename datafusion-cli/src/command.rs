@@ -17,6 +17,7 @@
 
 //! Command within CLI
 
+use crate::exec::exec_from_lines;
 use crate::functions::{display_all_functions, Function};
 use crate::print_format::PrintFormat;
 use crate::print_options::PrintOptions;
@@ -26,6 +27,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
+use std::fs::File;
+use std::io::BufReader;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,8 +39,9 @@ pub enum Command {
     Quit,
     Help,
     ListTables,
-    DescribeTable(String),
+    DescribeTableStmt(String),
     ListFunctions,
+    Include(Option<String>),
     SearchFunctions(String),
     QuietMode(Option<bool>),
     OutputFormat(Option<String>),
@@ -55,22 +59,32 @@ impl Command {
     ) -> Result<()> {
         let now = Instant::now();
         match self {
-            Self::Help => print_options
-                .print_batches(&[all_commands_info()], now)
-                .map_err(|e| DataFusionError::Execution(e.to_string())),
+            Self::Help => print_options.print_batches(&[all_commands_info()], now),
             Self::ListTables => {
                 let df = ctx.sql("SHOW TABLES").await?;
                 let batches = df.collect().await?;
-                print_options
-                    .print_batches(&batches, now)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))
+                print_options.print_batches(&batches, now)
             }
-            Self::DescribeTable(name) => {
+            Self::DescribeTableStmt(name) => {
                 let df = ctx.sql(&format!("SHOW COLUMNS FROM {}", name)).await?;
                 let batches = df.collect().await?;
-                print_options
-                    .print_batches(&batches, now)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))
+                print_options.print_batches(&batches, now)
+            }
+            Self::Include(filename) => {
+                if let Some(filename) = filename {
+                    let file = File::open(filename).map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Error opening {:?} {}",
+                            filename, e
+                        ))
+                    })?;
+                    exec_from_lines(ctx, &mut BufReader::new(file), print_options).await;
+                    Ok(())
+                } else {
+                    Err(DataFusionError::Execution(
+                        "Required filename argument is missing".into(),
+                    ))
+                }
             }
             Self::QuietMode(quiet) => {
                 if let Some(quiet) = quiet {
@@ -111,8 +125,11 @@ impl Command {
         match self {
             Self::Quit => ("\\q", "quit datafusion-cli"),
             Self::ListTables => ("\\d", "list tables"),
-            Self::DescribeTable(_) => ("\\d name", "describe table"),
+            Self::DescribeTableStmt(_) => ("\\d name", "describe table"),
             Self::Help => ("\\?", "help"),
+            Self::Include(_) => {
+                ("\\i filename", "reads input from the specified filename")
+            }
             Self::ListFunctions => ("\\h", "function list"),
             Self::SearchFunctions(_) => ("\\h function", "search function"),
             Self::QuietMode(_) => ("\\quiet (true|false)?", "print or set quiet mode"),
@@ -123,11 +140,12 @@ impl Command {
     }
 }
 
-const ALL_COMMANDS: [Command; 8] = [
+const ALL_COMMANDS: [Command; 9] = [
     Command::ListTables,
-    Command::DescribeTable(String::new()),
+    Command::DescribeTableStmt(String::new()),
     Command::Quit,
     Command::Help,
+    Command::Include(Some(String::new())),
     Command::ListFunctions,
     Command::SearchFunctions(String::new()),
     Command::QuietMode(None),
@@ -156,7 +174,7 @@ fn all_commands_info() -> RecordBatch {
 impl FromStr for Command {
     type Err = ();
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (c, arg) = if let Some((a, b)) = s.split_once(' ') {
             (a, Some(b))
         } else {
@@ -165,10 +183,12 @@ impl FromStr for Command {
         Ok(match (c, arg) {
             ("q", None) => Self::Quit,
             ("d", None) => Self::ListTables,
-            ("d", Some(name)) => Self::DescribeTable(name.into()),
+            ("d", Some(name)) => Self::DescribeTableStmt(name.into()),
             ("?", None) => Self::Help,
             ("h", None) => Self::ListFunctions,
             ("h", Some(function)) => Self::SearchFunctions(function.into()),
+            ("i", None) => Self::Include(None),
+            ("i", Some(filename)) => Self::Include(Some(filename.to_owned())),
             ("quiet", Some("true" | "t" | "yes" | "y" | "on")) => {
                 Self::QuietMode(Some(true))
             }
@@ -188,7 +208,7 @@ impl FromStr for Command {
 impl FromStr for OutputFormat {
     type Err = ();
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (c, arg) = if let Some((a, b)) = s.split_once(' ') {
             (a, Some(b))
         } else {

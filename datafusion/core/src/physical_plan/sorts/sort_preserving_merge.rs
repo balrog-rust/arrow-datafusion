@@ -17,30 +17,28 @@
 
 //! Defines the sort preserving merge plan
 
-use crate::physical_plan::metrics::{
-    ExecutionPlanMetricsSet, MemTrackingMetrics, MetricsSet,
-};
-use log::debug;
-use parking_lot::Mutex;
 use std::any::Any;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow::row::{RowConverter, SortField};
 use arrow::{
     array::{make_array as make_arrow_array, MutableArrayData},
-    compute::SortOptions,
     datatypes::SchemaRef,
-    error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
 use futures::stream::{Fuse, FusedStream};
-use futures::{Stream, StreamExt};
+use futures::{ready, Stream, StreamExt};
+use log::debug;
 use tokio::sync::mpsc;
 
 use crate::error::{DataFusionError, Result};
 use crate::execution::context::TaskContext;
+use crate::physical_plan::metrics::{
+    ExecutionPlanMetricsSet, MemTrackingMetrics, MetricsSet,
+};
 use crate::physical_plan::sorts::{RowIndex, SortKeyCursor, SortedStream};
 use crate::physical_plan::stream::RecordBatchReceiverStream;
 use crate::physical_plan::{
@@ -48,6 +46,7 @@ use crate::physical_plan::{
     Distribution, ExecutionPlan, Partitioning, PhysicalExpr, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion_physical_expr::EquivalenceProperties;
 
 /// Sort preserving merge execution plan
 ///
@@ -122,16 +121,20 @@ impl ExecutionPlan for SortPreservingMergeExec {
         Partitioning::UnknownPartitioning(1)
     }
 
-    fn required_child_distribution(&self) -> Distribution {
-        Distribution::UnspecifiedDistribution
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::UnspecifiedDistribution]
     }
 
-    fn relies_on_input_order(&self) -> bool {
-        true
+    fn required_input_ordering(&self) -> Vec<Option<&[PhysicalSortExpr]>> {
+        vec![Some(&self.expr)]
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
         Some(&self.expr)
+    }
+
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        self.input.equivalence_properties()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -159,12 +162,12 @@ impl ExecutionPlan for SortPreservingMergeExec {
         );
         if 0 != partition {
             return Err(DataFusionError::Internal(format!(
-                "SortPreservingMergeExec invalid partition {}",
-                partition
+                "SortPreservingMergeExec invalid partition {partition}"
             )));
         }
 
-        let tracking_metrics = MemTrackingMetrics::new(&self.metrics, partition);
+        let tracking_metrics =
+            MemTrackingMetrics::new(&self.metrics, context.memory_pool(), partition);
 
         let input_partitions = self.input.output_partitioning().partition_count();
         debug!(
@@ -188,7 +191,6 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 // Use tokio only if running from a tokio context (#2201)
                 let receivers = match tokio::runtime::Handle::try_current() {
                     Ok(_) => (0..input_partitions)
-                        .into_iter()
                         .map(|part_i| {
                             let (sender, receiver) = mpsc::channel(1);
                             let join_handle = spawn_execution(
@@ -225,7 +227,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
                     &self.expr,
                     tracking_metrics,
                     context.session_config().batch_size(),
-                ));
+                )?);
 
                 debug!("Got stream result from SortPreservingMergeStream::new_from_receivers");
 
@@ -258,7 +260,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
 
 struct MergingStreams {
     /// The sorted input streams to merge together
-    streams: Mutex<Vec<Fuse<SendableRecordBatchStream>>>,
+    streams: Vec<Fuse<SendableRecordBatchStream>>,
     /// number of streams
     num_streams: usize,
 }
@@ -275,7 +277,7 @@ impl MergingStreams {
     fn new(input_streams: Vec<Fuse<SendableRecordBatchStream>>) -> Self {
         Self {
             num_streams: input_streams.len(),
-            streams: Mutex::new(input_streams),
+            streams: input_streams,
         }
     }
 
@@ -298,18 +300,11 @@ pub(crate) struct SortPreservingMergeStream {
     /// their rows have been yielded to the output
     batches: Vec<VecDeque<RecordBatch>>,
 
-    /// Maintain a flag for each stream denoting if the current cursor
-    /// has finished and needs to poll from the stream
-    cursor_finished: Vec<bool>,
-
     /// The accumulated row indexes for the next record batch
     in_progress: Vec<RowIndex>,
 
     /// The physical expressions to sort by
     column_expressions: Vec<Arc<dyn PhysicalExpr>>,
-
-    /// The sort options for each expression
-    sort_options: Arc<Vec<SortOptions>>,
 
     /// used to record execution metrics
     tracking_metrics: MemTrackingMetrics,
@@ -320,11 +315,34 @@ pub(crate) struct SortPreservingMergeStream {
     /// An id to uniquely identify the input stream batch
     next_batch_id: usize,
 
-    /// min heap for record comparison
-    min_heap: BinaryHeap<SortKeyCursor>,
+    /// Vector that holds all [`SortKeyCursor`]s
+    cursors: Vec<Option<SortKeyCursor>>,
+
+    /// A loser tree that always produces the minimum cursor
+    ///
+    /// Node 0 stores the top winner, Nodes 1..num_streams store
+    /// the loser nodes
+    ///
+    /// This implements a "Tournament Tree" (aka Loser Tree) to keep
+    /// track of the current smallest element at the top. When the top
+    /// record is taken, the tree structure is not modified, and only
+    /// the path from bottom to top is visited, keeping the number of
+    /// comparisons close to the theoretical limit of `log(S)`.
+    ///
+    /// reference: <https://en.wikipedia.org/wiki/K-way_merge_algorithm#Tournament_Tree>
+    loser_tree: Vec<usize>,
+
+    /// If the most recently yielded overall winner has been replaced
+    /// within the loser tree. A value of `false` indicates that the
+    /// overall winner has been yielded but the loser tree has not
+    /// been updated
+    loser_tree_adjusted: bool,
 
     /// target batch size
     batch_size: usize,
+
+    /// row converter
+    row_converter: RowConverter,
 }
 
 impl SortPreservingMergeStream {
@@ -332,31 +350,38 @@ impl SortPreservingMergeStream {
         streams: Vec<SortedStream>,
         schema: SchemaRef,
         expressions: &[PhysicalSortExpr],
-        tracking_metrics: MemTrackingMetrics,
+        mut tracking_metrics: MemTrackingMetrics,
         batch_size: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let stream_count = streams.len();
-        let batches = (0..stream_count)
-            .into_iter()
-            .map(|_| VecDeque::new())
-            .collect();
+        let batches = (0..stream_count).map(|_| VecDeque::new()).collect();
         tracking_metrics.init_mem_used(streams.iter().map(|s| s.mem_used).sum());
         let wrappers = streams.into_iter().map(|s| s.stream.fuse()).collect();
 
-        Self {
+        let sort_fields = expressions
+            .iter()
+            .map(|expr| {
+                let data_type = expr.expr.data_type(&schema)?;
+                Ok(SortField::new_with_options(data_type, expr.options))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let row_converter = RowConverter::new(sort_fields)?;
+
+        Ok(Self {
             schema,
             batches,
-            cursor_finished: vec![true; stream_count],
             streams: MergingStreams::new(wrappers),
             column_expressions: expressions.iter().map(|x| x.expr.clone()).collect(),
-            sort_options: Arc::new(expressions.iter().map(|x| x.options).collect()),
             tracking_metrics,
             aborted: false,
             in_progress: vec![],
             next_batch_id: 0,
-            min_heap: BinaryHeap::with_capacity(stream_count),
+            cursors: (0..stream_count).map(|_| None).collect(),
+            loser_tree: Vec::with_capacity(stream_count),
+            loser_tree_adjusted: false,
             batch_size,
-        }
+            row_converter,
+        })
     }
 
     /// If the stream at the given index is not exhausted, and the last cursor for the
@@ -366,16 +391,18 @@ impl SortPreservingMergeStream {
         &mut self,
         cx: &mut Context<'_>,
         idx: usize,
-    ) -> Poll<ArrowResult<()>> {
-        if !self.cursor_finished[idx] {
+    ) -> Poll<Result<()>> {
+        if self.cursors[idx]
+            .as_ref()
+            .map(|cursor| !cursor.is_finished())
+            .unwrap_or(false)
+        {
             // Cursor is not finished - don't need a new RecordBatch yet
             return Poll::Ready(Ok(()));
         }
         let mut empty_batch = false;
         {
-            let mut streams = self.streams.streams.lock();
-
-            let stream = &mut streams[idx];
+            let stream = &mut self.streams.streams[idx];
             if stream.is_terminated() {
                 return Poll::Ready(Ok(()));
             }
@@ -388,23 +415,27 @@ impl SortPreservingMergeStream {
                 }
                 Some(Ok(batch)) => {
                     if batch.num_rows() > 0 {
-                        let cursor = match SortKeyCursor::new(
-                            idx,
-                            self.next_batch_id, // assign this batch an ID
-                            &batch,
-                            &self.column_expressions,
-                            self.sort_options.clone(),
-                        ) {
-                            Ok(cursor) => cursor,
+                        let cols = self
+                            .column_expressions
+                            .iter()
+                            .map(|expr| {
+                                Ok(expr.evaluate(&batch)?.into_array(batch.num_rows()))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        let rows = match self.row_converter.convert_columns(&cols) {
+                            Ok(rows) => rows,
                             Err(e) => {
-                                return Poll::Ready(Err(ArrowError::ExternalError(
-                                    Box::new(e),
-                                )));
+                                return Poll::Ready(Err(DataFusionError::ArrowError(e)));
                             }
                         };
+
+                        self.cursors[idx] = Some(SortKeyCursor::new(
+                            idx,
+                            self.next_batch_id, // assign this batch an ID
+                            rows,
+                        ));
                         self.next_batch_id += 1;
-                        self.min_heap.push(cursor);
-                        self.cursor_finished[idx] = false;
                         self.batches[idx].push_back(batch)
                     } else {
                         empty_batch = true;
@@ -423,7 +454,7 @@ impl SortPreservingMergeStream {
     /// Drains the in_progress row indexes, and builds a new RecordBatch from them
     ///
     /// Will then drop any batches for which all rows have been yielded to the output
-    fn build_record_batch(&mut self) -> ArrowResult<RecordBatch> {
+    fn build_record_batch(&mut self) -> Result<RecordBatch> {
         // Mapping from stream index to the index of the first buffer from that stream
         let mut buffer_idx = 0;
         let mut stream_to_buffer_idx = Vec::with_capacity(self.batches.len());
@@ -505,12 +536,12 @@ impl SortPreservingMergeStream {
             }
         }
 
-        RecordBatch::try_new(self.schema.clone(), columns)
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(Into::into)
     }
 }
 
 impl Stream for SortPreservingMergeStream {
-    type Item = ArrowResult<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
@@ -526,70 +557,146 @@ impl SortPreservingMergeStream {
     fn poll_next_inner(
         self: &mut Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<ArrowResult<RecordBatch>>> {
+    ) -> Poll<Option<Result<RecordBatch>>> {
         if self.aborted {
             return Poll::Ready(None);
+        }
+        // try to initialize the loser tree
+        if let Err(e) = ready!(self.init_loser_tree(cx)) {
+            return Poll::Ready(Some(Err(e)));
+        }
+
+        // NB timer records time taken on drop, so there are no
+        // calls to `timer.done()` below.
+        let elapsed_compute = self.tracking_metrics.elapsed_compute().clone();
+        let _timer = elapsed_compute.timer();
+
+        loop {
+            // Adjust the loser tree if necessary, returning control if needed
+            if let Err(e) = ready!(self.update_loser_tree(cx)) {
+                return Poll::Ready(Some(Err(e)));
+            }
+
+            let min_cursor_idx = self.loser_tree[0];
+            let next = self.cursors[min_cursor_idx]
+                .as_mut()
+                .filter(|cursor| !cursor.is_finished())
+                .map(|cursor| (cursor.stream_idx(), cursor.advance()));
+
+            if let Some((stream_idx, row_idx)) = next {
+                self.loser_tree_adjusted = false;
+                let batch_idx = self.batches[stream_idx].len() - 1;
+                self.in_progress.push(RowIndex {
+                    stream_idx,
+                    batch_idx,
+                    row_idx,
+                });
+                if self.in_progress.len() == self.batch_size {
+                    return Poll::Ready(Some(self.build_record_batch()));
+                }
+            } else if !self.in_progress.is_empty() {
+                return Poll::Ready(Some(self.build_record_batch()));
+            } else {
+                return Poll::Ready(None);
+            }
+        }
+    }
+
+    /// Attempts to initialize the loser tree with one value from each
+    /// non exhausted input, if possible.
+    ///
+    /// Returns
+    /// * Poll::Pending when more data is needed
+    /// * Poll::Ready(Ok()) on success
+    /// * Poll::Ready(Err..) if any of the inputs  errored
+    #[inline]
+    fn init_loser_tree(
+        self: &mut Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
+        let num_streams = self.streams.num_streams();
+
+        if !self.loser_tree.is_empty() {
+            return Poll::Ready(Ok(()));
         }
 
         // Ensure all non-exhausted streams have a cursor from which
         // rows can be pulled
-        for i in 0..self.streams.num_streams() {
-            match futures::ready!(self.maybe_poll_stream(cx, i)) {
-                Ok(_) => {}
-                Err(e) => {
-                    self.aborted = true;
-                    return Poll::Ready(Some(Err(e)));
-                }
+        for i in 0..num_streams {
+            if let Err(e) = ready!(self.maybe_poll_stream(cx, i)) {
+                self.aborted = true;
+                return Poll::Ready(Err(e));
             }
         }
 
-        loop {
-            // NB timer records time taken on drop, so there are no
-            // calls to `timer.done()` below.
-            let elapsed_compute = self.tracking_metrics.elapsed_compute().clone();
-            let _timer = elapsed_compute.timer();
+        // Init loser tree
+        self.loser_tree.resize(num_streams, usize::MAX);
+        for i in 0..num_streams {
+            let mut winner = i;
+            let mut cmp_node = (num_streams + i) / 2;
+            while cmp_node != 0 && self.loser_tree[cmp_node] != usize::MAX {
+                let challenger = self.loser_tree[cmp_node];
+                let challenger_win =
+                    match (&self.cursors[winner], &self.cursors[challenger]) {
+                        (None, _) => true,
+                        (_, None) => false,
+                        (Some(winner), Some(challenger)) => challenger < winner,
+                    };
 
-            match self.min_heap.pop() {
-                Some(mut cursor) => {
-                    let stream_idx = cursor.stream_idx();
-                    let batch_idx = self.batches[stream_idx].len() - 1;
-                    let row_idx = cursor.advance();
-
-                    let mut cursor_finished = false;
-                    // insert the cursor back to min_heap if the record batch is not exhausted
-                    if !cursor.is_finished() {
-                        self.min_heap.push(cursor);
-                    } else {
-                        cursor_finished = true;
-                        self.cursor_finished[stream_idx] = true;
-                    }
-
-                    self.in_progress.push(RowIndex {
-                        stream_idx,
-                        batch_idx,
-                        row_idx,
-                    });
-
-                    if self.in_progress.len() == self.batch_size {
-                        return Poll::Ready(Some(self.build_record_batch()));
-                    }
-
-                    // If removed the last row from the cursor, need to fetch a new record
-                    // batch if possible, before looping round again
-                    if cursor_finished {
-                        match futures::ready!(self.maybe_poll_stream(cx, stream_idx)) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                self.aborted = true;
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                        }
-                    }
+                if challenger_win {
+                    self.loser_tree[cmp_node] = winner;
+                    winner = challenger;
                 }
-                None if self.in_progress.is_empty() => return Poll::Ready(None),
-                None => return Poll::Ready(Some(self.build_record_batch())),
+
+                cmp_node /= 2;
             }
+            self.loser_tree[cmp_node] = winner;
         }
+        self.loser_tree_adjusted = true;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Attempts to updated the loser tree, if possible
+    ///
+    /// Returns
+    /// * Poll::Pending when the winning unput was not ready
+    /// * Poll::Ready(Ok()) on success
+    /// * Poll::Ready(Err..) if any of the winning input erroed
+    #[inline]
+    fn update_loser_tree(
+        self: &mut Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
+        if self.loser_tree_adjusted {
+            return Poll::Ready(Ok(()));
+        }
+
+        let num_streams = self.streams.num_streams();
+        let mut winner = self.loser_tree[0];
+        if let Err(e) = ready!(self.maybe_poll_stream(cx, winner)) {
+            self.aborted = true;
+            return Poll::Ready(Err(e));
+        }
+
+        // Replace overall winner by walking tree of losers
+        let mut cmp_node = (num_streams + winner) / 2;
+        while cmp_node != 0 {
+            let challenger = self.loser_tree[cmp_node];
+            let challenger_win = match (&self.cursors[winner], &self.cursors[challenger])
+            {
+                (None, _) => true,
+                (_, None) => false,
+                (Some(winner), Some(challenger)) => challenger < winner,
+            };
+            if challenger_win {
+                self.loser_tree[cmp_node] = winner;
+                winner = challenger;
+            }
+            cmp_node /= 2;
+        }
+        self.loser_tree[0] = winner;
+        self.loser_tree_adjusted = true;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -601,32 +708,34 @@ impl RecordBatchStream for SortPreservingMergeStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::from_slice::FromSlice;
-    use crate::physical_plan::metrics::MetricValue;
-    use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
-    use arrow::array::ArrayRef;
     use std::iter::FromIterator;
 
+    use arrow::array::ArrayRef;
+    use arrow::compute::SortOptions;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::FutureExt;
+    use tokio_stream::StreamExt;
+
     use crate::arrow::array::{Int32Array, StringArray, TimestampNanosecondArray};
+    use crate::from_slice::FromSlice;
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::expressions::col;
     use crate::physical_plan::memory::MemoryExec;
+    use crate::physical_plan::metrics::MetricValue;
     use crate::physical_plan::sorts::sort::SortExec;
     use crate::physical_plan::{collect, common};
+    use crate::prelude::{SessionConfig, SessionContext};
+    use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
     use crate::test::{self, assert_is_pending};
     use crate::{assert_batches_eq, test_util};
 
     use super::*;
-    use crate::prelude::{SessionConfig, SessionContext};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use futures::FutureExt;
-    use tokio_stream::StreamExt;
 
     #[tokio::test]
     async fn test_merge_interleave() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 7, 9, 3]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([1, 2, 7, 9, 3]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("a"),
             Some("c"),
@@ -637,7 +746,7 @@ mod tests {
         let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![8, 7, 6, 5, 8]));
         let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[10, 20, 70, 90, 30]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([10, 20, 70, 90, 30]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("b"),
             Some("d"),
@@ -654,16 +763,16 @@ mod tests {
                 "+----+---+-------------------------------+",
                 "| a  | b | c                             |",
                 "+----+---+-------------------------------+",
-                "| 1  | a | 1970-01-01 00:00:00.000000008 |",
-                "| 10 | b | 1970-01-01 00:00:00.000000004 |",
-                "| 2  | c | 1970-01-01 00:00:00.000000007 |",
-                "| 20 | d | 1970-01-01 00:00:00.000000006 |",
-                "| 7  | e | 1970-01-01 00:00:00.000000006 |",
-                "| 70 | f | 1970-01-01 00:00:00.000000002 |",
-                "| 9  | g | 1970-01-01 00:00:00.000000005 |",
-                "| 90 | h | 1970-01-01 00:00:00.000000002 |",
-                "| 30 | j | 1970-01-01 00:00:00.000000006 |", // input b2 before b1
-                "| 3  | j | 1970-01-01 00:00:00.000000008 |",
+                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
+                "| 10 | b | 1970-01-01T00:00:00.000000004 |",
+                "| 2  | c | 1970-01-01T00:00:00.000000007 |",
+                "| 20 | d | 1970-01-01T00:00:00.000000006 |",
+                "| 7  | e | 1970-01-01T00:00:00.000000006 |",
+                "| 70 | f | 1970-01-01T00:00:00.000000002 |",
+                "| 9  | g | 1970-01-01T00:00:00.000000005 |",
+                "| 90 | h | 1970-01-01T00:00:00.000000002 |",
+                "| 30 | j | 1970-01-01T00:00:00.000000006 |", // input b2 before b1
+                "| 3  | j | 1970-01-01T00:00:00.000000008 |",
                 "+----+---+-------------------------------+",
             ],
             task_ctx,
@@ -675,7 +784,7 @@ mod tests {
     async fn test_merge_some_overlap() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 7, 9, 3]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([1, 2, 7, 9, 3]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("a"),
             Some("b"),
@@ -686,7 +795,7 @@ mod tests {
         let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![8, 7, 6, 5, 8]));
         let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[70, 90, 30, 100, 110]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([70, 90, 30, 100, 110]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("c"),
             Some("d"),
@@ -703,16 +812,16 @@ mod tests {
                 "+-----+---+-------------------------------+",
                 "| a   | b | c                             |",
                 "+-----+---+-------------------------------+",
-                "| 1   | a | 1970-01-01 00:00:00.000000008 |",
-                "| 2   | b | 1970-01-01 00:00:00.000000007 |",
-                "| 70  | c | 1970-01-01 00:00:00.000000004 |",
-                "| 7   | c | 1970-01-01 00:00:00.000000006 |",
-                "| 9   | d | 1970-01-01 00:00:00.000000005 |",
-                "| 90  | d | 1970-01-01 00:00:00.000000006 |",
-                "| 30  | e | 1970-01-01 00:00:00.000000002 |",
-                "| 3   | e | 1970-01-01 00:00:00.000000008 |",
-                "| 100 | f | 1970-01-01 00:00:00.000000002 |",
-                "| 110 | g | 1970-01-01 00:00:00.000000006 |",
+                "| 1   | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2   | b | 1970-01-01T00:00:00.000000007 |",
+                "| 70  | c | 1970-01-01T00:00:00.000000004 |",
+                "| 7   | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9   | d | 1970-01-01T00:00:00.000000005 |",
+                "| 90  | d | 1970-01-01T00:00:00.000000006 |",
+                "| 30  | e | 1970-01-01T00:00:00.000000002 |",
+                "| 3   | e | 1970-01-01T00:00:00.000000008 |",
+                "| 100 | f | 1970-01-01T00:00:00.000000002 |",
+                "| 110 | g | 1970-01-01T00:00:00.000000006 |",
                 "+-----+---+-------------------------------+",
             ],
             task_ctx,
@@ -724,7 +833,7 @@ mod tests {
     async fn test_merge_no_overlap() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 7, 9, 3]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([1, 2, 7, 9, 3]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("a"),
             Some("b"),
@@ -735,7 +844,7 @@ mod tests {
         let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![8, 7, 6, 5, 8]));
         let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[10, 20, 70, 90, 30]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([10, 20, 70, 90, 30]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("f"),
             Some("g"),
@@ -752,16 +861,16 @@ mod tests {
                 "+----+---+-------------------------------+",
                 "| a  | b | c                             |",
                 "+----+---+-------------------------------+",
-                "| 1  | a | 1970-01-01 00:00:00.000000008 |",
-                "| 2  | b | 1970-01-01 00:00:00.000000007 |",
-                "| 7  | c | 1970-01-01 00:00:00.000000006 |",
-                "| 9  | d | 1970-01-01 00:00:00.000000005 |",
-                "| 3  | e | 1970-01-01 00:00:00.000000008 |",
-                "| 10 | f | 1970-01-01 00:00:00.000000004 |",
-                "| 20 | g | 1970-01-01 00:00:00.000000006 |",
-                "| 70 | h | 1970-01-01 00:00:00.000000002 |",
-                "| 90 | i | 1970-01-01 00:00:00.000000002 |",
-                "| 30 | j | 1970-01-01 00:00:00.000000006 |",
+                "| 1  | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2  | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7  | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9  | d | 1970-01-01T00:00:00.000000005 |",
+                "| 3  | e | 1970-01-01T00:00:00.000000008 |",
+                "| 10 | f | 1970-01-01T00:00:00.000000004 |",
+                "| 20 | g | 1970-01-01T00:00:00.000000006 |",
+                "| 70 | h | 1970-01-01T00:00:00.000000002 |",
+                "| 90 | i | 1970-01-01T00:00:00.000000002 |",
+                "| 30 | j | 1970-01-01T00:00:00.000000006 |",
                 "+----+---+-------------------------------+",
             ],
             task_ctx,
@@ -773,7 +882,7 @@ mod tests {
     async fn test_merge_three_partitions() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 7, 9, 3]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([1, 2, 7, 9, 3]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("a"),
             Some("b"),
@@ -784,7 +893,7 @@ mod tests {
         let c: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![8, 7, 6, 5, 8]));
         let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[10, 20, 70, 90, 30]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([10, 20, 70, 90, 30]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("e"),
             Some("g"),
@@ -796,7 +905,7 @@ mod tests {
             Arc::new(TimestampNanosecondArray::from(vec![40, 60, 20, 20, 60]));
         let b2 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[100, 200, 700, 900, 300]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([100, 200, 700, 900, 300]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             Some("f"),
             Some("g"),
@@ -813,21 +922,21 @@ mod tests {
                 "+-----+---+-------------------------------+",
                 "| a   | b | c                             |",
                 "+-----+---+-------------------------------+",
-                "| 1   | a | 1970-01-01 00:00:00.000000008 |",
-                "| 2   | b | 1970-01-01 00:00:00.000000007 |",
-                "| 7   | c | 1970-01-01 00:00:00.000000006 |",
-                "| 9   | d | 1970-01-01 00:00:00.000000005 |",
-                "| 10  | e | 1970-01-01 00:00:00.000000040 |",
-                "| 100 | f | 1970-01-01 00:00:00.000000004 |",
-                "| 3   | f | 1970-01-01 00:00:00.000000008 |",
-                "| 200 | g | 1970-01-01 00:00:00.000000006 |",
-                "| 20  | g | 1970-01-01 00:00:00.000000060 |",
-                "| 700 | h | 1970-01-01 00:00:00.000000002 |",
-                "| 70  | h | 1970-01-01 00:00:00.000000020 |",
-                "| 900 | i | 1970-01-01 00:00:00.000000002 |",
-                "| 90  | i | 1970-01-01 00:00:00.000000020 |",
-                "| 300 | j | 1970-01-01 00:00:00.000000006 |",
-                "| 30  | j | 1970-01-01 00:00:00.000000060 |",
+                "| 1   | a | 1970-01-01T00:00:00.000000008 |",
+                "| 2   | b | 1970-01-01T00:00:00.000000007 |",
+                "| 7   | c | 1970-01-01T00:00:00.000000006 |",
+                "| 9   | d | 1970-01-01T00:00:00.000000005 |",
+                "| 10  | e | 1970-01-01T00:00:00.000000040 |",
+                "| 100 | f | 1970-01-01T00:00:00.000000004 |",
+                "| 3   | f | 1970-01-01T00:00:00.000000008 |",
+                "| 200 | g | 1970-01-01T00:00:00.000000006 |",
+                "| 20  | g | 1970-01-01T00:00:00.000000060 |",
+                "| 700 | h | 1970-01-01T00:00:00.000000002 |",
+                "| 70  | h | 1970-01-01T00:00:00.000000020 |",
+                "| 900 | i | 1970-01-01T00:00:00.000000002 |",
+                "| 90  | i | 1970-01-01T00:00:00.000000020 |",
+                "| 300 | j | 1970-01-01T00:00:00.000000006 |",
+                "| 30  | j | 1970-01-01T00:00:00.000000060 |",
                 "+-----+---+-------------------------------+",
             ],
             task_ctx,
@@ -874,8 +983,12 @@ mod tests {
         sort: Vec<PhysicalSortExpr>,
         context: Arc<TaskContext>,
     ) -> RecordBatch {
-        let sort_exec =
-            Arc::new(SortExec::new_with_partitioning(sort.clone(), input, true));
+        let sort_exec = Arc::new(SortExec::new_with_partitioning(
+            sort.clone(),
+            input,
+            true,
+            None,
+        ));
         sorted_merge(sort_exec, sort, context).await
     }
 
@@ -885,7 +998,7 @@ mod tests {
         context: Arc<TaskContext>,
     ) -> RecordBatch {
         let merge = Arc::new(CoalescePartitionsExec::new(src));
-        let sort_exec = Arc::new(SortExec::try_new(sort, merge).unwrap());
+        let sort_exec = Arc::new(SortExec::try_new(sort, merge, None).unwrap());
         let mut result = collect(sort_exec, context).await.unwrap();
         assert_eq!(result.len(), 1);
         result.remove(0)
@@ -933,8 +1046,7 @@ mod tests {
 
         assert_eq!(
             basic, partition,
-            "basic:\n\n{}\n\npartition:\n\n{}\n\n",
-            basic, partition
+            "basic:\n\n{basic}\n\npartition:\n\n{partition}\n\n"
         );
     }
 
@@ -944,7 +1056,6 @@ mod tests {
 
         // Split the sorted RecordBatch into multiple
         (0..batches)
-            .into_iter()
             .map(|batch_idx| {
                 let columns = (0..sorted.num_columns())
                     .map(|column_idx| {
@@ -1071,7 +1182,7 @@ mod tests {
     async fn test_nulls() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 7, 9, 3]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([1, 2, 7, 9, 3]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             None,
             Some("a"),
@@ -1088,7 +1199,7 @@ mod tests {
         ]));
         let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b), ("c", c)]).unwrap();
 
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2, 3, 4, 5]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([1, 2, 3, 4, 5]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![
             None,
             Some("b"),
@@ -1133,16 +1244,16 @@ mod tests {
                 "+---+---+-------------------------------+",
                 "| a | b | c                             |",
                 "+---+---+-------------------------------+",
-                "| 1 |   | 1970-01-01 00:00:00.000000008 |",
-                "| 1 |   | 1970-01-01 00:00:00.000000008 |",
+                "| 1 |   | 1970-01-01T00:00:00.000000008 |",
+                "| 1 |   | 1970-01-01T00:00:00.000000008 |",
                 "| 2 | a |                               |",
-                "| 7 | b | 1970-01-01 00:00:00.000000006 |",
+                "| 7 | b | 1970-01-01T00:00:00.000000006 |",
                 "| 2 | b |                               |",
                 "| 9 | d |                               |",
-                "| 3 | e | 1970-01-01 00:00:00.000000004 |",
-                "| 3 | g | 1970-01-01 00:00:00.000000005 |",
+                "| 3 | e | 1970-01-01T00:00:00.000000004 |",
+                "| 3 | g | 1970-01-01T00:00:00.000000005 |",
                 "| 4 | h |                               |",
-                "| 5 | i | 1970-01-01 00:00:00.000000004 |",
+                "| 5 | i | 1970-01-01T00:00:00.000000004 |",
                 "+---+---+-------------------------------+",
             ],
             collected.as_slice()
@@ -1183,7 +1294,8 @@ mod tests {
         }
 
         let metrics = ExecutionPlanMetricsSet::new();
-        let tracking_metrics = MemTrackingMetrics::new(&metrics, 0);
+        let tracking_metrics =
+            MemTrackingMetrics::new(&metrics, task_ctx.memory_pool(), 0);
 
         let merge_stream = SortPreservingMergeStream::new_from_streams(
             streams,
@@ -1191,7 +1303,8 @@ mod tests {
             sort.as_slice(),
             tracking_metrics,
             task_ctx.session_config().batch_size(),
-        );
+        )
+        .unwrap();
 
         let mut merged = common::collect(Box::pin(merge_stream)).await.unwrap();
 
@@ -1208,8 +1321,7 @@ mod tests {
 
         assert_eq!(
             basic, partition,
-            "basic:\n\n{}\n\npartition:\n\n{}\n\n",
-            basic, partition
+            "basic:\n\n{basic}\n\npartition:\n\n{partition}\n\n"
         );
     }
 
@@ -1217,11 +1329,11 @@ mod tests {
     async fn test_merge_metrics() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[1, 2]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([1, 2]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![Some("a"), Some("c")]));
         let b1 = RecordBatch::try_from_iter(vec![("a", a), ("b", b)]).unwrap();
 
-        let a: ArrayRef = Arc::new(Int32Array::from_slice(&[10, 20]));
+        let a: ArrayRef = Arc::new(Int32Array::from_slice([10, 20]));
         let b: ArrayRef = Arc::new(StringArray::from_iter(vec![Some("b"), Some("d")]));
         let b2 = RecordBatch::try_from_iter(vec![("a", a), ("b", b)]).unwrap();
 

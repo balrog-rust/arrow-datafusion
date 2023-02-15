@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::Expr;
-use crate::binary_rule::binary_operator_data_type;
+use super::{Between, Expr, Like};
+use crate::expr::{
+    AggregateFunction, BinaryExpr, Cast, GetIndexedField, Sort, TryCast, WindowFunction,
+};
 use crate::field_util::get_indexed_field;
+use crate::type_coercion::binary::binary_operator_data_type;
 use crate::{aggregate_function, function, window_function};
 use arrow::compute::can_cast_types;
 use arrow::datatypes::DataType;
-use datafusion_common::{DFField, DFSchema, DataFusionError, ExprSchema, Result};
+use datafusion_common::{Column, DFField, DFSchema, DataFusionError, ExprSchema, Result};
 
 /// trait to allow expr to typable with respect to a schema
 pub trait ExprSchemable {
@@ -53,16 +56,20 @@ impl ExprSchemable for Expr {
     /// (e.g. `[utf8] + [bool]`).
     fn get_type<S: ExprSchema>(&self, schema: &S) -> Result<DataType> {
         match self {
-            Expr::Alias(expr, _) | Expr::Sort { expr, .. } | Expr::Negative(expr) => {
-                expr.get_type(schema)
-            }
+            Expr::Alias(expr, name) => match &**expr {
+                Expr::Placeholder { data_type, .. } => match &data_type {
+                    None => schema.data_type(&Column::from_name(name)).cloned(),
+                    Some(dt) => Ok(dt.clone()),
+                },
+                _ => expr.get_type(schema),
+            },
+            Expr::Sort(Sort { expr, .. }) | Expr::Negative(expr) => expr.get_type(schema),
             Expr::Column(c) => Ok(schema.data_type(c)?.clone()),
             Expr::ScalarVariable(ty, _) => Ok(ty.clone()),
             Expr::Literal(l) => Ok(l.get_datatype()),
-            Expr::Case { when_then_expr, .. } => when_then_expr[0].1.get_type(schema),
-            Expr::Cast { data_type, .. } | Expr::TryCast { data_type, .. } => {
-                Ok(data_type.clone())
-            }
+            Expr::Case(case) => case.when_then_expr[0].1.get_type(schema),
+            Expr::Cast(Cast { data_type, .. })
+            | Expr::TryCast(TryCast { data_type, .. }) => Ok(data_type.clone()),
             Expr::ScalarUDF { fun, args } => {
                 let data_types = args
                     .iter()
@@ -77,14 +84,14 @@ impl ExprSchemable for Expr {
                     .collect::<Result<Vec<_>>>()?;
                 function::return_type(fun, &data_types)
             }
-            Expr::WindowFunction { fun, args, .. } => {
+            Expr::WindowFunction(WindowFunction { fun, args, .. }) => {
                 let data_types = args
                     .iter()
                     .map(|e| e.get_type(schema))
                     .collect::<Result<Vec<_>>>()?;
                 window_function::return_type(fun, &data_types)
             }
-            Expr::AggregateFunction { fun, args, .. } => {
+            Expr::AggregateFunction(AggregateFunction { fun, args, .. }) => {
                 let data_types = args
                     .iter()
                     .map(|e| e.get_type(schema))
@@ -104,19 +111,31 @@ impl ExprSchemable for Expr {
             | Expr::InSubquery { .. }
             | Expr::Between { .. }
             | Expr::InList { .. }
-            | Expr::IsNotNull(_) => Ok(DataType::Boolean),
+            | Expr::IsNotNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsNotUnknown(_) => Ok(DataType::Boolean),
             Expr::ScalarSubquery(subquery) => {
                 Ok(subquery.subquery.schema().field(0).data_type().clone())
             }
-            Expr::BinaryExpr {
+            Expr::BinaryExpr(BinaryExpr {
                 ref left,
                 ref right,
                 ref op,
-            } => binary_operator_data_type(
+            }) => binary_operator_data_type(
                 &left.get_type(schema)?,
                 op,
                 &right.get_type(schema)?,
             ),
+            Expr::Like { .. } | Expr::ILike { .. } | Expr::SimilarTo { .. } => {
+                Ok(DataType::Boolean)
+            }
+            Expr::Placeholder { data_type, .. } => data_type.clone().ok_or_else(|| {
+                DataFusionError::Plan("Placeholder type could not be resolved".to_owned())
+            }),
             Expr::Wildcard => Err(DataFusionError::Internal(
                 "Wildcard expressions are not valid in a logical query plan".to_owned(),
             )),
@@ -128,7 +147,7 @@ impl ExprSchemable for Expr {
                 // grouping sets do not really have a type and do not appear in projections
                 Ok(DataType::Null)
             }
-            Expr::GetIndexedField { ref expr, key } => {
+            Expr::GetIndexedField(GetIndexedField { key, expr }) => {
                 let data_type = expr.get_type(schema)?;
 
                 get_indexed_field(&data_type, key).map(|x| x.data_type().clone())
@@ -150,24 +169,21 @@ impl ExprSchemable for Expr {
             Expr::Alias(expr, _)
             | Expr::Not(expr)
             | Expr::Negative(expr)
-            | Expr::Sort { expr, .. }
-            | Expr::Between { expr, .. }
+            | Expr::Sort(Sort { expr, .. })
             | Expr::InList { expr, .. } => expr.nullable(input_schema),
+            Expr::Between(Between { expr, .. }) => expr.nullable(input_schema),
             Expr::Column(c) => input_schema.nullable(c),
             Expr::Literal(value) => Ok(value.is_null()),
-            Expr::Case {
-                when_then_expr,
-                else_expr,
-                ..
-            } => {
+            Expr::Case(case) => {
                 // this expression is nullable if any of the input expressions are nullable
-                let then_nullable = when_then_expr
+                let then_nullable = case
+                    .when_then_expr
                     .iter()
                     .map(|(_, t)| t.nullable(input_schema))
                     .collect::<Result<Vec<_>>>()?;
                 if then_nullable.contains(&true) {
                     Ok(true)
-                } else if let Some(e) = else_expr {
+                } else if let Some(e) = &case.else_expr {
                     e.nullable(input_schema)
                 } else {
                     // CASE produces NULL if there is no `else` expr
@@ -175,7 +191,7 @@ impl ExprSchemable for Expr {
                     Ok(true)
                 }
             }
-            Expr::Cast { expr, .. } => expr.nullable(input_schema),
+            Expr::Cast(Cast { expr, .. }) => expr.nullable(input_schema),
             Expr::ScalarVariable(_, _)
             | Expr::TryCast { .. }
             | Expr::ScalarFunction { .. }
@@ -183,16 +199,28 @@ impl ExprSchemable for Expr {
             | Expr::WindowFunction { .. }
             | Expr::AggregateFunction { .. }
             | Expr::AggregateUDF { .. } => Ok(true),
-            Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::Exists { .. } => Ok(false),
+            Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::Exists { .. }
+            | Expr::Placeholder { .. } => Ok(true),
             Expr::InSubquery { expr, .. } => expr.nullable(input_schema),
             Expr::ScalarSubquery(subquery) => {
                 Ok(subquery.subquery.schema().field(0).is_nullable())
             }
-            Expr::BinaryExpr {
+            Expr::BinaryExpr(BinaryExpr {
                 ref left,
                 ref right,
                 ..
-            } => Ok(left.nullable(input_schema)? || right.nullable(input_schema)?),
+            }) => Ok(left.nullable(input_schema)? || right.nullable(input_schema)?),
+            Expr::Like(Like { expr, .. }) => expr.nullable(input_schema),
+            Expr::ILike(Like { expr, .. }) => expr.nullable(input_schema),
+            Expr::SimilarTo(Like { expr, .. }) => expr.nullable(input_schema),
             Expr::Wildcard => Err(DataFusionError::Internal(
                 "Wildcard expressions are not valid in a logical query plan".to_owned(),
             )),
@@ -200,7 +228,7 @@ impl ExprSchemable for Expr {
                 "QualifiedWildcard expressions are not valid in a logical query plan"
                     .to_owned(),
             )),
-            Expr::GetIndexedField { ref expr, key } => {
+            Expr::GetIndexedField(GetIndexedField { key, expr }) => {
                 let data_type = expr.get_type(input_schema)?;
                 get_indexed_field(&data_type, key).map(|x| x.is_nullable())
             }
@@ -213,6 +241,9 @@ impl ExprSchemable for Expr {
     }
 
     /// Returns a [arrow::datatypes::Field] compatible with this expression.
+    ///
+    /// So for example, a projected expression `col(c1) + col(c2)` is
+    /// placed in an output field **named** col("c1 + c2")
     fn to_field(&self, input_schema: &DFSchema) -> Result<DFField> {
         match self {
             Expr::Column(c) => Ok(DFField::new(
@@ -223,7 +254,7 @@ impl ExprSchemable for Expr {
             )),
             _ => Ok(DFField::new(
                 None,
-                &self.name(input_schema)?,
+                &self.display_name()?,
                 self.get_type(input_schema)?,
                 self.nullable(input_schema)?,
             )),
@@ -244,14 +275,10 @@ impl ExprSchemable for Expr {
         if this_type == *cast_to_type {
             Ok(self)
         } else if can_cast_types(&this_type, cast_to_type) {
-            Ok(Expr::Cast {
-                expr: Box::new(self),
-                data_type: cast_to_type.clone(),
-            })
+            Ok(Expr::Cast(Cast::new(Box::new(self), cast_to_type.clone())))
         } else {
             Err(DataFusionError::Plan(format!(
-                "Cannot automatically convert {:?} to {:?}",
-                this_type, cast_to_type
+                "Cannot automatically convert {this_type:?} to {cast_to_type:?}"
             )))
         }
     }

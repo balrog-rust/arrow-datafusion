@@ -18,9 +18,8 @@
 use std::sync::Arc;
 
 use arrow::{array::StringArray, record_batch::RecordBatch};
-use datafusion::{
-    assert_batches_sorted_eq, assert_contains, datasource::MemTable, prelude::*,
-};
+use datafusion::{assert_batches_sorted_eq, prelude::*};
+use datafusion_common::assert_contains;
 
 use crate::sql::plan_and_collect;
 
@@ -32,7 +31,7 @@ async fn normalized_column_identifiers() {
     // register csv file with the execution context
     ctx.register_csv(
         "case_insensitive_test",
-        "tests/example.csv",
+        "tests/data/example.csv",
         CsvReadOptions::new(),
     )
     .await
@@ -203,11 +202,8 @@ async fn case_insensitive_in_sql_errors() {
     ])
     .unwrap();
 
-    let table =
-        MemTable::try_new(record_batch.schema(), vec![vec![record_batch]]).unwrap();
-
     let ctx = SessionContext::new();
-    ctx.register_table("test", Arc::new(table)).unwrap();
+    ctx.register_batch("test", record_batch).unwrap();
 
     // None of these tests shoud pass
     let actual = ctx

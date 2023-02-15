@@ -23,13 +23,14 @@ mod case;
 mod cast;
 mod column;
 mod datetime;
-mod delta;
 mod get_indexed_field;
 mod in_list;
 mod is_not_null;
 mod is_null;
+mod like;
 mod literal;
 mod negative;
+mod no_op;
 mod not;
 mod nullif;
 mod try_cast;
@@ -62,9 +63,13 @@ pub use crate::aggregate::sum_distinct::DistinctSum;
 pub use crate::aggregate::variance::{Variance, VariancePop};
 
 pub use crate::window::cume_dist::cume_dist;
+pub use crate::window::cume_dist::CumeDist;
+pub use crate::window::lead_lag::WindowShift;
 pub use crate::window::lead_lag::{lag, lead};
 pub use crate::window::nth_value::NthValue;
+pub use crate::window::ntile::Ntile;
 pub use crate::window::rank::{dense_rank, percent_rank, rank};
+pub use crate::window::rank::{Rank, RankType};
 pub use crate::window::row_number::RowNumber;
 
 pub use binary::{binary, BinaryExpr};
@@ -72,21 +77,23 @@ pub use case::{case, CaseExpr};
 pub use cast::{
     cast, cast_column, cast_with_options, CastExpr, DEFAULT_DATAFUSION_CAST_OPTIONS,
 };
-pub use column::{col, Column};
-pub use datetime::DateIntervalExpr;
+pub use column::{col, Column, UnKnownColumn};
+pub use datetime::DateTimeIntervalExpr;
 pub use get_indexed_field::GetIndexedFieldExpr;
 pub use in_list::{in_list, InListExpr};
 pub use is_not_null::{is_not_null, IsNotNullExpr};
 pub use is_null::{is_null, IsNullExpr};
+pub use like::{like, LikeExpr};
 pub use literal::{lit, Literal};
 pub use negative::{negative, NegativeExpr};
+pub use no_op::NoOp;
 pub use not::{not, NotExpr};
 pub use nullif::nullif_func;
 pub use try_cast::{try_cast, TryCastExpr};
 
 /// returns the name of the state
 pub fn format_state_name(name: &str, state_name: &str) -> String {
-    format!("{}[{}]", name, state_name)
+    format!("{name}[{state_name}]")
 }
 pub use crate::PhysicalSortExpr;
 
@@ -101,6 +108,9 @@ pub(crate) mod tests {
     /// macro to perform an aggregation and verify the result.
     #[macro_export]
     macro_rules! generic_test_op {
+        ($ARRAY:expr, $DATATYPE:expr, $OP:ident, $EXPECTED:expr) => {
+            generic_test_op!($ARRAY, $DATATYPE, $OP, $EXPECTED, $EXPECTED.get_datatype())
+        };
         ($ARRAY:expr, $DATATYPE:expr, $OP:ident, $EXPECTED:expr, $EXPECTED_DATATYPE:expr) => {{
             let schema = Schema::new(vec![Field::new("a", $DATATYPE, true)]);
 
@@ -123,6 +133,17 @@ pub(crate) mod tests {
     /// macro to perform an aggregation with two inputs and verify the result.
     #[macro_export]
     macro_rules! generic_test_op2 {
+        ($ARRAY1:expr, $ARRAY2:expr, $DATATYPE1:expr, $DATATYPE2:expr, $OP:ident, $EXPECTED:expr) => {
+            generic_test_op2!(
+                $ARRAY1,
+                $ARRAY2,
+                $DATATYPE1,
+                $DATATYPE2,
+                $OP,
+                $EXPECTED,
+                $EXPECTED.get_datatype()
+            )
+        };
         ($ARRAY1:expr, $ARRAY2:expr, $DATATYPE1:expr, $DATATYPE2:expr, $OP:ident, $EXPECTED:expr, $EXPECTED_DATATYPE:expr) => {{
             let schema = Schema::new(vec![
                 Field::new("a", $DATATYPE1, true),

@@ -17,21 +17,21 @@
 
 //! Eliminate common sub-expression.
 
-use crate::{OptimizerConfig, OptimizerRule};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+
 use arrow::datatypes::DataType;
-use datafusion_common::{DFField, DFSchema, Result};
+
+use datafusion_common::{DFField, DFSchema, DFSchemaRef, DataFusionError, Result};
 use datafusion_expr::{
     col,
-    expr::GroupingSet,
     expr_rewriter::{ExprRewritable, ExprRewriter, RewriteRecursion},
     expr_visitor::{ExprVisitable, ExpressionVisitor, Recursion},
     logical_plan::{Aggregate, Filter, LogicalPlan, Projection, Sort, Window},
-    utils::from_plan,
     Expr, ExprSchemable,
 };
-use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
-use std::sync::Arc;
+
+use crate::{utils, OptimizerConfig, OptimizerRule};
 
 /// A map from expression's identifier to tuple including
 /// - the expression itself (cloned)
@@ -56,13 +56,208 @@ type Identifier = String;
 /// be eliminated.
 pub struct CommonSubexprEliminate {}
 
+impl CommonSubexprEliminate {
+    fn rewrite_expr(
+        &self,
+        exprs_list: &[&[Expr]],
+        arrays_list: &[&[Vec<(usize, String)>]],
+        input: &LogicalPlan,
+        expr_set: &mut ExprSet,
+        config: &dyn OptimizerConfig,
+    ) -> Result<(Vec<Vec<Expr>>, LogicalPlan)> {
+        let mut affected_id = BTreeSet::<Identifier>::new();
+
+        let rewrite_exprs = exprs_list
+            .iter()
+            .zip(arrays_list.iter())
+            .map(|(exprs, arrays)| {
+                exprs
+                    .iter()
+                    .cloned()
+                    .zip(arrays.iter())
+                    .map(|(expr, id_array)| {
+                        replace_common_expr(expr, id_array, expr_set, &mut affected_id)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut new_input = self
+            .try_optimize(input, config)?
+            .unwrap_or_else(|| input.clone());
+        if !affected_id.is_empty() {
+            new_input = build_common_expr_project_plan(new_input, affected_id, expr_set)?;
+        }
+
+        Ok((rewrite_exprs, new_input))
+    }
+}
+
 impl OptimizerRule for CommonSubexprEliminate {
-    fn optimize(
+    fn try_optimize(
         &self,
         plan: &LogicalPlan,
-        optimizer_config: &mut OptimizerConfig,
-    ) -> Result<LogicalPlan> {
-        optimize(plan, optimizer_config)
+        config: &dyn OptimizerConfig,
+    ) -> Result<Option<LogicalPlan>> {
+        let mut expr_set = ExprSet::new();
+
+        let original_schema = plan.schema().clone();
+        let optimized_plan = match plan {
+            LogicalPlan::Projection(Projection {
+                expr,
+                input,
+                schema,
+                ..
+            }) => {
+                let input_schema = Arc::clone(input.schema());
+                let arrays = to_arrays(expr, input_schema, &mut expr_set)?;
+
+                let (mut new_expr, new_input) =
+                    self.rewrite_expr(&[expr], &[&arrays], input, &mut expr_set, config)?;
+
+                Some(LogicalPlan::Projection(Projection::try_new_with_schema(
+                    pop_expr(&mut new_expr)?,
+                    Arc::new(new_input),
+                    schema.clone(),
+                )?))
+            }
+            LogicalPlan::Filter(filter) => {
+                let input = &filter.input;
+                let predicate = &filter.predicate;
+                let input_schema = Arc::clone(input.schema());
+                let mut id_array = vec![];
+                expr_to_identifier(
+                    predicate,
+                    &mut expr_set,
+                    &mut id_array,
+                    input_schema,
+                )?;
+
+                let (mut new_expr, new_input) = self.rewrite_expr(
+                    &[&[predicate.clone()]],
+                    &[&[id_array]],
+                    &filter.input,
+                    &mut expr_set,
+                    config,
+                )?;
+
+                if let Some(predicate) = pop_expr(&mut new_expr)?.pop() {
+                    Some(LogicalPlan::Filter(Filter::try_new(
+                        predicate,
+                        Arc::new(new_input),
+                    )?))
+                } else {
+                    return Err(DataFusionError::Internal(
+                        "Failed to pop predicate expr".to_string(),
+                    ));
+                }
+            }
+            LogicalPlan::Window(Window {
+                input,
+                window_expr,
+                schema,
+            }) => {
+                let input_schema = Arc::clone(input.schema());
+                let arrays = to_arrays(window_expr, input_schema, &mut expr_set)?;
+
+                let (mut new_expr, new_input) = self.rewrite_expr(
+                    &[window_expr],
+                    &[&arrays],
+                    input,
+                    &mut expr_set,
+                    config,
+                )?;
+
+                Some(LogicalPlan::Window(Window {
+                    input: Arc::new(new_input),
+                    window_expr: pop_expr(&mut new_expr)?,
+                    schema: schema.clone(),
+                }))
+            }
+            LogicalPlan::Aggregate(Aggregate {
+                group_expr,
+                aggr_expr,
+                input,
+                schema,
+                ..
+            }) => {
+                let input_schema = Arc::clone(input.schema());
+                let group_arrays =
+                    to_arrays(group_expr, Arc::clone(&input_schema), &mut expr_set)?;
+                let aggr_arrays = to_arrays(aggr_expr, input_schema, &mut expr_set)?;
+
+                let (mut new_expr, new_input) = self.rewrite_expr(
+                    &[group_expr, aggr_expr],
+                    &[&group_arrays, &aggr_arrays],
+                    input,
+                    &mut expr_set,
+                    config,
+                )?;
+                // note the reversed pop order.
+                let new_aggr_expr = pop_expr(&mut new_expr)?;
+                let new_group_expr = pop_expr(&mut new_expr)?;
+
+                Some(LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
+                    Arc::new(new_input),
+                    new_group_expr,
+                    new_aggr_expr,
+                    schema.clone(),
+                )?))
+            }
+            LogicalPlan::Sort(Sort { expr, input, fetch }) => {
+                let input_schema = Arc::clone(input.schema());
+                let arrays = to_arrays(expr, input_schema, &mut expr_set)?;
+
+                let (mut new_expr, new_input) =
+                    self.rewrite_expr(&[expr], &[&arrays], input, &mut expr_set, config)?;
+
+                Some(LogicalPlan::Sort(Sort {
+                    expr: pop_expr(&mut new_expr)?,
+                    input: Arc::new(new_input),
+                    fetch: *fetch,
+                }))
+            }
+            LogicalPlan::Join(_)
+            | LogicalPlan::CrossJoin(_)
+            | LogicalPlan::Repartition(_)
+            | LogicalPlan::Union(_)
+            | LogicalPlan::TableScan(_)
+            | LogicalPlan::Values(_)
+            | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Subquery(_)
+            | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::Limit(_)
+            | LogicalPlan::CreateExternalTable(_)
+            | LogicalPlan::Explain(_)
+            | LogicalPlan::Analyze(_)
+            | LogicalPlan::CreateMemoryTable(_)
+            | LogicalPlan::CreateView(_)
+            | LogicalPlan::CreateCatalogSchema(_)
+            | LogicalPlan::CreateCatalog(_)
+            | LogicalPlan::DropTable(_)
+            | LogicalPlan::DropView(_)
+            | LogicalPlan::SetVariable(_)
+            | LogicalPlan::DescribeTable(_)
+            | LogicalPlan::Distinct(_)
+            | LogicalPlan::Extension(_)
+            | LogicalPlan::Dml(_)
+            | LogicalPlan::Unnest(_)
+            | LogicalPlan::Prepare(_) => {
+                // apply the optimization to all inputs of the plan
+                utils::optimize_children(self, plan, config)?
+            }
+        };
+
+        match optimized_plan {
+            Some(optimized_plan) if optimized_plan.schema() != &original_schema => {
+                // add an additional projection if the output schema changed.
+                Ok(Some(build_recover_project_plan(
+                    &original_schema,
+                    optimized_plan,
+                )))
+            }
+            plan => Ok(plan),
+        }
     }
 
     fn name(&self) -> &str {
@@ -83,179 +278,21 @@ impl CommonSubexprEliminate {
     }
 }
 
-fn optimize(
-    plan: &LogicalPlan,
-    optimizer_config: &OptimizerConfig,
-) -> Result<LogicalPlan> {
-    let mut expr_set = ExprSet::new();
-
-    match plan {
-        LogicalPlan::Projection(Projection {
-            expr,
-            input,
-            schema,
-            alias,
-        }) => {
-            let arrays = to_arrays(expr, input, &mut expr_set)?;
-
-            let (mut new_expr, new_input) = rewrite_expr(
-                &[expr],
-                &[&arrays],
-                input,
-                &mut expr_set,
-                schema,
-                optimizer_config,
-            )?;
-
-            Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
-                new_expr.pop().unwrap(),
-                Arc::new(new_input),
-                schema.clone(),
-                alias.clone(),
-            )?))
-        }
-        LogicalPlan::Filter(Filter { predicate, input }) => {
-            let schema = plan.schema().as_ref().clone();
-            let data_type = if let Ok(data_type) = predicate.get_type(&schema) {
-                data_type
-            } else {
-                // predicate type could not be resolved in schema, fall back to all schemas
-                let schemas = plan.all_schemas();
-                let all_schema =
-                    schemas.into_iter().fold(DFSchema::empty(), |mut lhs, rhs| {
-                        lhs.merge(rhs);
-                        lhs
-                    });
-                predicate.get_type(&all_schema)?
-            };
-
-            let mut id_array = vec![];
-            expr_to_identifier(predicate, &mut expr_set, &mut id_array, data_type)?;
-
-            let (mut new_expr, new_input) = rewrite_expr(
-                &[&[predicate.clone()]],
-                &[&[id_array]],
-                input,
-                &mut expr_set,
-                input.schema(),
-                optimizer_config,
-            )?;
-
-            Ok(LogicalPlan::Filter(Filter {
-                predicate: new_expr.pop().unwrap().pop().unwrap(),
-                input: Arc::new(new_input),
-            }))
-        }
-        LogicalPlan::Window(Window {
-            input,
-            window_expr,
-            schema,
-        }) => {
-            let arrays = to_arrays(window_expr, input, &mut expr_set)?;
-
-            let (mut new_expr, new_input) = rewrite_expr(
-                &[window_expr],
-                &[&arrays],
-                input,
-                &mut expr_set,
-                schema,
-                optimizer_config,
-            )?;
-
-            Ok(LogicalPlan::Window(Window {
-                input: Arc::new(new_input),
-                window_expr: new_expr.pop().unwrap(),
-                schema: schema.clone(),
-            }))
-        }
-        LogicalPlan::Aggregate(Aggregate {
-            group_expr,
-            aggr_expr,
-            input,
-            schema,
-        }) => {
-            let group_arrays = to_arrays(group_expr, input, &mut expr_set)?;
-            let aggr_arrays = to_arrays(aggr_expr, input, &mut expr_set)?;
-
-            let (mut new_expr, new_input) = rewrite_expr(
-                &[group_expr, aggr_expr],
-                &[&group_arrays, &aggr_arrays],
-                input,
-                &mut expr_set,
-                schema,
-                optimizer_config,
-            )?;
-            // note the reversed pop order.
-            let new_aggr_expr = new_expr.pop().unwrap();
-            let new_group_expr = new_expr.pop().unwrap();
-
-            Ok(LogicalPlan::Aggregate(Aggregate {
-                input: Arc::new(new_input),
-                group_expr: new_group_expr,
-                aggr_expr: new_aggr_expr,
-                schema: schema.clone(),
-            }))
-        }
-        LogicalPlan::Sort(Sort { expr, input }) => {
-            let arrays = to_arrays(expr, input, &mut expr_set)?;
-
-            let (mut new_expr, new_input) = rewrite_expr(
-                &[expr],
-                &[&arrays],
-                input,
-                &mut expr_set,
-                input.schema(),
-                optimizer_config,
-            )?;
-
-            Ok(LogicalPlan::Sort(Sort {
-                expr: new_expr.pop().unwrap(),
-                input: Arc::new(new_input),
-            }))
-        }
-        LogicalPlan::Join { .. }
-        | LogicalPlan::CrossJoin(_)
-        | LogicalPlan::Repartition(_)
-        | LogicalPlan::Union(_)
-        | LogicalPlan::TableScan { .. }
-        | LogicalPlan::Values(_)
-        | LogicalPlan::EmptyRelation(_)
-        | LogicalPlan::Subquery(_)
-        | LogicalPlan::SubqueryAlias(_)
-        | LogicalPlan::Limit(_)
-        | LogicalPlan::CreateExternalTable(_)
-        | LogicalPlan::Explain { .. }
-        | LogicalPlan::Analyze { .. }
-        | LogicalPlan::CreateMemoryTable(_)
-        | LogicalPlan::CreateView(_)
-        | LogicalPlan::CreateCatalogSchema(_)
-        | LogicalPlan::CreateCatalog(_)
-        | LogicalPlan::DropTable(_)
-        | LogicalPlan::Distinct(_)
-        | LogicalPlan::Extension { .. } => {
-            // apply the optimization to all inputs of the plan
-            let expr = plan.expressions();
-            let inputs = plan.inputs();
-            let new_inputs = inputs
-                .iter()
-                .map(|input_plan| optimize(input_plan, optimizer_config))
-                .collect::<Result<Vec<_>>>()?;
-
-            from_plan(plan, &expr, &new_inputs)
-        }
-    }
+fn pop_expr(new_expr: &mut Vec<Vec<Expr>>) -> Result<Vec<Expr>> {
+    new_expr
+        .pop()
+        .ok_or_else(|| DataFusionError::Internal("Failed to pop expression".to_string()))
 }
 
 fn to_arrays(
     expr: &[Expr],
-    input: &LogicalPlan,
+    input_schema: DFSchemaRef,
     expr_set: &mut ExprSet,
 ) -> Result<Vec<Vec<(usize, String)>>> {
     expr.iter()
         .map(|e| {
-            let data_type = e.get_type(input.schema())?;
             let mut id_array = vec![];
-            expr_to_identifier(e, expr_set, &mut id_array, data_type)?;
+            expr_to_identifier(e, expr_set, &mut id_array, Arc::clone(&input_schema))?;
 
             Ok(id_array)
         })
@@ -263,79 +300,56 @@ fn to_arrays(
 }
 
 /// Build the "intermediate" projection plan that evaluates the extracted common expressions.
-fn build_project_plan(
+fn build_common_expr_project_plan(
     input: LogicalPlan,
-    affected_id: HashSet<Identifier>,
+    affected_id: BTreeSet<Identifier>,
     expr_set: &ExprSet,
 ) -> Result<LogicalPlan> {
     let mut project_exprs = vec![];
-    let mut fields = vec![];
-    let mut fields_set = HashSet::new();
+    let mut fields_set = BTreeSet::new();
 
     for id in affected_id {
-        let (expr, _, data_type) = expr_set.get(&id).unwrap();
-        // todo: check `nullable`
-        let field = DFField::new(None, &id, data_type.clone(), true);
-        fields_set.insert(field.name().to_owned());
-        fields.push(field);
-        project_exprs.push(expr.clone().alias(&id));
+        match expr_set.get(&id) {
+            Some((expr, _, data_type)) => {
+                // todo: check `nullable`
+                let field = DFField::new(None, &id, data_type.clone(), true);
+                fields_set.insert(field.name().to_owned());
+                project_exprs.push(expr.clone().alias(&id));
+            }
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "expr_set invalid state".to_string(),
+                ));
+            }
+        }
     }
 
     for field in input.schema().fields() {
         if fields_set.insert(field.qualified_name()) {
-            fields.push(field.clone());
             project_exprs.push(Expr::Column(field.qualified_column()));
         }
     }
 
-    let schema = DFSchema::new_with_metadata(fields, HashMap::new())?;
-
-    Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+    Ok(LogicalPlan::Projection(Projection::try_new(
         project_exprs,
         Arc::new(input),
-        Arc::new(schema),
-        None,
     )?))
 }
 
-#[inline]
-fn rewrite_expr(
-    exprs_list: &[&[Expr]],
-    arrays_list: &[&[Vec<(usize, String)>]],
-    input: &LogicalPlan,
-    expr_set: &mut ExprSet,
-    schema: &DFSchema,
-    optimizer_config: &OptimizerConfig,
-) -> Result<(Vec<Vec<Expr>>, LogicalPlan)> {
-    let mut affected_id = HashSet::<Identifier>::new();
-
-    let rewrote_exprs = exprs_list
+/// Build the projection plan to eliminate unexpected columns produced by
+/// the "intermediate" projection plan built in [build_common_expr_project_plan].
+///
+/// This is for those plans who don't keep its own output schema like `Filter` or `Sort`.
+fn build_recover_project_plan(schema: &DFSchema, input: LogicalPlan) -> LogicalPlan {
+    let col_exprs = schema
+        .fields()
         .iter()
-        .zip(arrays_list.iter())
-        .map(|(exprs, arrays)| {
-            exprs
-                .iter()
-                .cloned()
-                .zip(arrays.iter())
-                .map(|(expr, id_array)| {
-                    replace_common_expr(
-                        expr,
-                        id_array,
-                        expr_set,
-                        &mut affected_id,
-                        schema,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut new_input = optimize(input, optimizer_config)?;
-    if !affected_id.is_empty() {
-        new_input = build_project_plan(new_input, affected_id, expr_set)?;
-    }
-
-    Ok((rewrote_exprs, new_input))
+        .map(|field| Expr::Column(field.qualified_column()))
+        .collect();
+    LogicalPlan::Projection(
+        Projection::try_new(col_exprs, Arc::new(input))
+            .expect("Cannot build projection plan from an invalid schema"),
+    )
 }
 
 /// Go through an expression tree and generate identifier.
@@ -362,8 +376,9 @@ struct ExprIdentifierVisitor<'a> {
     expr_set: &'a mut ExprSet,
     /// series number (usize) and identifier.
     id_array: &'a mut Vec<(usize, Identifier)>,
-    data_type: DataType,
-
+    /// input schema for the node that we're optimizing, so we can determine the correct datatype
+    /// for each subexpression
+    input_schema: DFSchemaRef,
     // inner states
     visit_stack: Vec<VisitRecord>,
     /// increased in pre_visit, start from 0.
@@ -383,141 +398,7 @@ enum VisitRecord {
 
 impl ExprIdentifierVisitor<'_> {
     fn desc_expr(expr: &Expr) -> String {
-        let mut desc = String::new();
-        match expr {
-            Expr::Column(column) => {
-                desc.push_str("Column-");
-                desc.push_str(&column.flat_name());
-            }
-            Expr::ScalarVariable(_, var_names) => {
-                desc.push_str("ScalarVariable-");
-                desc.push_str(&var_names.join("."));
-            }
-            Expr::Alias(_, alias) => {
-                desc.push_str("Alias-");
-                desc.push_str(alias);
-            }
-            Expr::Literal(value) => {
-                desc.push_str("Literal");
-                desc.push_str(&value.to_string());
-            }
-            Expr::BinaryExpr { op, .. } => {
-                desc.push_str("BinaryExpr-");
-                desc.push_str(&op.to_string());
-            }
-            Expr::Not(_) => {
-                desc.push_str("Not-");
-            }
-            Expr::IsNotNull(_) => {
-                desc.push_str("IsNotNull-");
-            }
-            Expr::IsNull(_) => {
-                desc.push_str("IsNull-");
-            }
-            Expr::Negative(_) => {
-                desc.push_str("Negative-");
-            }
-            Expr::Between { negated, .. } => {
-                desc.push_str("Between-");
-                desc.push_str(&negated.to_string());
-            }
-            Expr::Case { .. } => {
-                desc.push_str("Case-");
-            }
-            Expr::Cast { data_type, .. } => {
-                desc.push_str("Cast-");
-                let _ = write!(desc, "{:?}", data_type);
-            }
-            Expr::TryCast { data_type, .. } => {
-                desc.push_str("TryCast-");
-                let _ = write!(desc, "{:?}", data_type);
-            }
-            Expr::Sort {
-                asc, nulls_first, ..
-            } => {
-                desc.push_str("Sort-");
-                let _ = write!(desc, "{}{}", asc, nulls_first);
-            }
-            Expr::ScalarFunction { fun, .. } => {
-                desc.push_str("ScalarFunction-");
-                desc.push_str(&fun.to_string());
-            }
-            Expr::ScalarUDF { fun, .. } => {
-                desc.push_str("ScalarUDF-");
-                desc.push_str(&fun.name);
-            }
-            Expr::WindowFunction {
-                fun, window_frame, ..
-            } => {
-                desc.push_str("WindowFunction-");
-                desc.push_str(&fun.to_string());
-                let _ = write!(desc, "{:?}", window_frame);
-            }
-            Expr::AggregateFunction { fun, distinct, .. } => {
-                desc.push_str("AggregateFunction-");
-                desc.push_str(&fun.to_string());
-                desc.push_str(&distinct.to_string());
-            }
-            Expr::AggregateUDF { fun, .. } => {
-                desc.push_str("AggregateUDF-");
-                desc.push_str(&fun.name);
-            }
-            Expr::InList { negated, .. } => {
-                desc.push_str("InList-");
-                desc.push_str(&negated.to_string());
-            }
-            Expr::Exists { negated, .. } => {
-                desc.push_str("Exists-");
-                desc.push_str(&negated.to_string());
-            }
-            Expr::InSubquery { negated, .. } => {
-                desc.push_str("InSubquery-");
-                desc.push_str(&negated.to_string());
-            }
-            Expr::ScalarSubquery(_) => {
-                desc.push_str("ScalarSubquery-");
-            }
-            Expr::Wildcard => {
-                desc.push_str("Wildcard-");
-            }
-            Expr::QualifiedWildcard { qualifier } => {
-                desc.push_str("QualifiedWildcard-");
-                desc.push_str(qualifier);
-            }
-            Expr::GetIndexedField { key, .. } => {
-                desc.push_str("GetIndexedField-");
-                desc.push_str(&key.to_string());
-            }
-            Expr::GroupingSet(grouping_set) => match grouping_set {
-                GroupingSet::Rollup(exprs) => {
-                    desc.push_str("Rollup");
-                    for expr in exprs {
-                        desc.push('-');
-                        desc.push_str(&Self::desc_expr(expr));
-                    }
-                }
-                GroupingSet::Cube(exprs) => {
-                    desc.push_str("Cube");
-                    for expr in exprs {
-                        desc.push('-');
-                        desc.push_str(&Self::desc_expr(expr));
-                    }
-                }
-                GroupingSet::GroupingSets(lists_of_exprs) => {
-                    desc.push_str("GroupingSets");
-                    for exprs in lists_of_exprs {
-                        desc.push('(');
-                        for expr in exprs {
-                            desc.push('-');
-                            desc.push_str(&Self::desc_expr(expr));
-                        }
-                        desc.push(')');
-                    }
-                }
-            },
-        }
-
-        desc
+        format!("{expr}")
     }
 
     /// Find the first `EnterMark` in the stack, and accumulates every `ExprItem`
@@ -574,7 +455,9 @@ impl ExpressionVisitor for ExprIdentifierVisitor<'_> {
 
         self.id_array[idx] = (self.series_number, desc.clone());
         self.visit_stack.push(VisitRecord::ExprItem(desc.clone()));
-        let data_type = self.data_type.clone();
+
+        let data_type = expr.get_type(&self.input_schema)?;
+
         self.expr_set
             .entry(desc)
             .or_insert_with(|| (expr.clone(), 0, data_type))
@@ -588,12 +471,12 @@ fn expr_to_identifier(
     expr: &Expr,
     expr_set: &mut ExprSet,
     id_array: &mut Vec<(usize, Identifier)>,
-    data_type: DataType,
+    input_schema: DFSchemaRef,
 ) -> Result<()> {
     expr.accept(ExprIdentifierVisitor {
         expr_set,
         id_array,
-        data_type,
+        input_schema,
         visit_stack: vec![],
         node_count: 0,
         series_number: 0,
@@ -609,8 +492,7 @@ struct CommonSubexprRewriter<'a> {
     expr_set: &'a mut ExprSet,
     id_array: &'a [(usize, Identifier)],
     /// Which identifier is replaced.
-    affected_id: &'a mut HashSet<Identifier>,
-    schema: &'a DFSchema,
+    affected_id: &'a mut BTreeSet<Identifier>,
 
     /// the max series number we have rewritten. Other expression nodes
     /// with smaller series number is already replaced and shouldn't
@@ -634,13 +516,19 @@ impl ExprRewriter for CommonSubexprRewriter<'_> {
             self.curr_index += 1;
             return Ok(RewriteRecursion::Skip);
         }
-        let (_, counter, _) = self.expr_set.get(curr_id).unwrap();
-        if *counter > 1 {
-            self.affected_id.insert(curr_id.clone());
-            Ok(RewriteRecursion::Mutate)
-        } else {
-            self.curr_index += 1;
-            Ok(RewriteRecursion::Skip)
+        match self.expr_set.get(curr_id) {
+            Some((_, counter, _)) => {
+                if *counter > 1 {
+                    self.affected_id.insert(curr_id.clone());
+                    Ok(RewriteRecursion::Mutate)
+                } else {
+                    self.curr_index += 1;
+                    Ok(RewriteRecursion::Skip)
+                }
+            }
+            _ => Err(DataFusionError::Internal(
+                "expr_set invalid state".to_string(),
+            )),
         }
     }
 
@@ -653,9 +541,12 @@ impl ExprRewriter for CommonSubexprRewriter<'_> {
         let (series_number, id) = &self.id_array[self.curr_index];
         self.curr_index += 1;
         // Skip sub-node of a replaced tree, or without identifier, or is not repeated expr.
+        let expr_set_item = self.expr_set.get(id).ok_or_else(|| {
+            DataFusionError::Internal("expr_set invalid state".to_string())
+        })?;
         if *series_number < self.max_series_number
             || id.is_empty()
-            || self.expr_set.get(id).unwrap().1 <= 1
+            || expr_set_item.1 <= 1
         {
             return Ok(expr);
         }
@@ -668,11 +559,11 @@ impl ExprRewriter for CommonSubexprRewriter<'_> {
             self.curr_index += 1;
         }
 
-        let expr_name = expr.name(self.schema)?;
+        let expr_name = expr.display_name()?;
         // Alias this `Column` expr to it original "expr name",
         // `projection_push_down` optimizer use "expr name" to eliminate useless
         // projections.
-        Ok(col(id).alias(&expr_name))
+        Ok(col(id).alias(expr_name))
     }
 }
 
@@ -680,14 +571,12 @@ fn replace_common_expr(
     expr: Expr,
     id_array: &[(usize, Identifier)],
     expr_set: &mut ExprSet,
-    affected_id: &mut HashSet<Identifier>,
-    schema: &DFSchema,
+    affected_id: &mut BTreeSet<Identifier>,
 ) -> Result<Expr> {
     expr.rewrite(&mut CommonSubexprRewriter {
         expr_set,
         id_array,
         affected_id,
-        schema,
         max_series_number: 0,
         curr_index: 0,
     })
@@ -695,29 +584,37 @@ fn replace_common_expr(
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::test::*;
-    use datafusion_expr::logical_plan::JoinType;
+    use std::iter;
+
+    use arrow::datatypes::{Field, Schema};
+
+    use datafusion_common::DFSchema;
+    use datafusion_expr::logical_plan::{table_scan, JoinType};
     use datafusion_expr::{
         avg, binary_expr, col, lit, logical_plan::builder::LogicalPlanBuilder, sum,
         Operator,
     };
-    use std::iter;
 
-    fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) {
+    use crate::optimizer::OptimizerContext;
+    use crate::test::*;
+
+    use super::*;
+
+    fn assert_optimized_plan_eq(expected: &str, plan: &LogicalPlan) {
         let optimizer = CommonSubexprEliminate {};
         let optimized_plan = optimizer
-            .optimize(plan, &mut OptimizerConfig::new())
+            .try_optimize(plan, &OptimizerContext::new())
+            .unwrap()
             .expect("failed to optimize plan");
-        let formatted_plan = format!("{:?}", optimized_plan);
-        assert_eq!(formatted_plan, expected);
+        let formatted_plan = format!("{optimized_plan:?}");
+        assert_eq!(expected, formatted_plan);
     }
 
     #[test]
     fn id_array_visitor() -> Result<()> {
         let expr = binary_expr(
             binary_expr(
-                sum(binary_expr(col("a"), Operator::Plus, lit("1"))),
+                sum(binary_expr(col("a"), Operator::Plus, lit(1))),
                 Operator::Minus,
                 avg(col("c")),
             ),
@@ -725,23 +622,37 @@ mod test {
             lit(2),
         );
 
+        let schema = Arc::new(DFSchema::new_with_metadata(
+            vec![
+                DFField::new(None, "a", DataType::Int64, false),
+                DFField::new(None, "c", DataType::Int64, false),
+            ],
+            Default::default(),
+        )?);
+
         let mut id_array = vec![];
-        expr_to_identifier(&expr, &mut HashMap::new(), &mut id_array, DataType::Int64)?;
+        expr_to_identifier(
+            &expr,
+            &mut HashMap::new(),
+            &mut id_array,
+            Arc::clone(&schema),
+        )?;
 
         let expected = vec![
-            (9, "BinaryExpr-*Literal2BinaryExpr--AggregateFunction-AVGfalseColumn-cAggregateFunction-SUMfalseBinaryExpr-+Literal1Column-a"),
-            (7, "BinaryExpr--AggregateFunction-AVGfalseColumn-cAggregateFunction-SUMfalseBinaryExpr-+Literal1Column-a"),
-            (4, "AggregateFunction-SUMfalseBinaryExpr-+Literal1Column-a"), (3, "BinaryExpr-+Literal1Column-a"),
+            (9, "(SUM(a + Int32(1)) - AVG(c)) * Int32(2)Int32(2)SUM(a + Int32(1)) - AVG(c)AVG(c)cSUM(a + Int32(1))a + Int32(1)Int32(1)a"),
+            (7, "SUM(a + Int32(1)) - AVG(c)AVG(c)cSUM(a + Int32(1))a + Int32(1)Int32(1)a"),
+            (4, "SUM(a + Int32(1))a + Int32(1)Int32(1)a"),
+            (3, "a + Int32(1)Int32(1)a"),
             (1, ""),
             (2, ""),
-            (6, "AggregateFunction-AVGfalseColumn-c"),
+            (6, "AVG(c)c"),
             (5, ""),
-            (8, ""),
+            (8, "")
         ]
         .into_iter()
         .map(|(number, id)| (number, id.into()))
         .collect::<Vec<_>>();
-        assert_eq!(id_array, expected);
+        assert_eq!(expected, id_array);
 
         Ok(())
     }
@@ -780,11 +691,11 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[]], aggr=[[SUM(#BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a AS test.a * Int32(1) - test.b), SUM(#BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a AS test.a * Int32(1) - test.b * Int32(1) + #test.c)]]\
-        \n  Projection: #test.a * Int32(1) - #test.b AS BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a, #test.a, #test.b, #test.c\
+        let expected = "Aggregate: groupBy=[[]], aggr=[[SUM(test.a * (Int32(1) - test.b)Int32(1) - test.btest.bInt32(1)test.a AS test.a * Int32(1) - test.b), SUM(test.a * (Int32(1) - test.b)Int32(1) - test.btest.bInt32(1)test.a AS test.a * Int32(1) - test.b * (Int32(1) + test.c))]]\
+        \n  Projection: test.a * (Int32(1) - test.b) AS test.a * (Int32(1) - test.b)Int32(1) - test.btest.bInt32(1)test.a, test.a, test.b, test.c\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_eq(expected, &plan);
 
         Ok(())
     }
@@ -803,11 +714,11 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[]], aggr=[[Int32(1) + #AggregateFunction-AVGfalseColumn-test.a AS AVG(test.a), Int32(1) - #AggregateFunction-AVGfalseColumn-test.a AS AVG(test.a)]]\
-        \n  Projection: AVG(#test.a) AS AggregateFunction-AVGfalseColumn-test.a, #test.a, #test.b, #test.c\
+        let expected = "Aggregate: groupBy=[[]], aggr=[[Int32(1) + AVG(test.a)test.a AS AVG(test.a), Int32(1) - AVG(test.a)test.a AS AVG(test.a)]]\
+        \n  Projection: AVG(test.a) AS AVG(test.a)test.a, test.a, test.b, test.c\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_eq(expected, &plan);
 
         Ok(())
     }
@@ -823,11 +734,11 @@ mod test {
             ])?
             .build()?;
 
-        let expected = "Projection: #BinaryExpr-+Column-test.aLiteral1 AS Int32(1) + test.a AS first, #BinaryExpr-+Column-test.aLiteral1 AS Int32(1) + test.a AS second\
-        \n  Projection: Int32(1) + #test.a AS BinaryExpr-+Column-test.aLiteral1, #test.a, #test.b, #test.c\
+        let expected = "Projection: Int32(1) + test.atest.aInt32(1) AS Int32(1) + test.a AS first, Int32(1) + test.atest.aInt32(1) AS Int32(1) + test.a AS second\
+        \n  Projection: Int32(1) + test.a AS Int32(1) + test.atest.aInt32(1), test.a, test.b, test.c\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_eq(expected, &plan);
 
         Ok(())
     }
@@ -843,10 +754,10 @@ mod test {
             ])?
             .build()?;
 
-        let expected = "Projection: Int32(1) + #test.a, #test.a + Int32(1)\
+        let expected = "Projection: Int32(1) + test.a, test.a + Int32(1)\
         \n  TableScan: test";
 
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_eq(expected, &plan);
 
         Ok(())
     }
@@ -860,31 +771,44 @@ mod test {
             .project(vec![binary_expr(lit(1), Operator::Plus, col("a"))])?
             .build()?;
 
-        let expected = "Projection: #Int32(1) + test.a\
-        \n  Projection: Int32(1) + #test.a\
+        let expected = "Projection: Int32(1) + test.a\
+        \n  Projection: Int32(1) + test.a\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(&plan, expected);
-
+        assert_optimized_plan_eq(expected, &plan);
         Ok(())
     }
 
     #[test]
     fn redundant_project_fields() {
         let table_scan = test_table_scan().unwrap();
-        let affected_id: HashSet<Identifier> =
-            ["c+a".to_string(), "d+a".to_string()].into_iter().collect();
-        let expr_set = [
+        let affected_id: BTreeSet<Identifier> =
+            ["c+a".to_string(), "b+a".to_string()].into_iter().collect();
+        let expr_set_1 = [
+            (
+                "c+a".to_string(),
+                (col("c") + col("a"), 1, DataType::UInt32),
+            ),
+            (
+                "b+a".to_string(),
+                (col("b") + col("a"), 1, DataType::UInt32),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let expr_set_2 = [
             ("c+a".to_string(), (col("c+a"), 1, DataType::UInt32)),
-            ("d+a".to_string(), (col("d+a"), 1, DataType::UInt32)),
+            ("b+a".to_string(), (col("b+a"), 1, DataType::UInt32)),
         ]
         .into_iter()
         .collect();
         let project =
-            build_project_plan(table_scan, affected_id.clone(), &expr_set).unwrap();
-        let project_2 = build_project_plan(project, affected_id, &expr_set).unwrap();
+            build_common_expr_project_plan(table_scan, affected_id.clone(), &expr_set_1)
+                .unwrap();
+        let project_2 =
+            build_common_expr_project_plan(project, affected_id, &expr_set_2).unwrap();
 
-        let mut field_set = HashSet::new();
+        let mut field_set = BTreeSet::new();
         for field in project_2.schema().fields() {
             assert!(field_set.insert(field.qualified_name()));
         }
@@ -895,24 +819,115 @@ mod test {
         let table_scan_1 = test_table_scan_with_name("test1").unwrap();
         let table_scan_2 = test_table_scan_with_name("test2").unwrap();
         let join = LogicalPlanBuilder::from(table_scan_1)
-            .join(&table_scan_2, JoinType::Inner, (vec!["a"], vec!["a"]), None)
+            .join(table_scan_2, JoinType::Inner, (vec!["a"], vec!["a"]), None)
             .unwrap()
             .build()
             .unwrap();
-        let affected_id: HashSet<Identifier> =
-            ["c+a".to_string(), "d+a".to_string()].into_iter().collect();
-        let expr_set = [
-            ("c+a".to_string(), (col("c+a"), 1, DataType::UInt32)),
-            ("d+a".to_string(), (col("d+a"), 1, DataType::UInt32)),
+        let affected_id: BTreeSet<Identifier> =
+            ["test1.c+test1.a".to_string(), "test1.b+test1.a".to_string()]
+                .into_iter()
+                .collect();
+        let expr_set_1 = [
+            (
+                "test1.c+test1.a".to_string(),
+                (col("test1.c") + col("test1.a"), 1, DataType::UInt32),
+            ),
+            (
+                "test1.b+test1.a".to_string(),
+                (col("test1.b") + col("test1.a"), 1, DataType::UInt32),
+            ),
         ]
         .into_iter()
         .collect();
-        let project = build_project_plan(join, affected_id.clone(), &expr_set).unwrap();
-        let project_2 = build_project_plan(project, affected_id, &expr_set).unwrap();
+        let expr_set_2 = [
+            (
+                "test1.c+test1.a".to_string(),
+                (col("test1.c+test1.a"), 1, DataType::UInt32),
+            ),
+            (
+                "test1.b+test1.a".to_string(),
+                (col("test1.b+test1.a"), 1, DataType::UInt32),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let project =
+            build_common_expr_project_plan(join, affected_id.clone(), &expr_set_1)
+                .unwrap();
+        let project_2 =
+            build_common_expr_project_plan(project, affected_id, &expr_set_2).unwrap();
 
-        let mut field_set = HashSet::new();
+        let mut field_set = BTreeSet::new();
         for field in project_2.schema().fields() {
             assert!(field_set.insert(field.qualified_name()));
         }
+    }
+
+    #[test]
+    fn eliminated_subexpr_datatype() {
+        use datafusion_expr::cast;
+
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::UInt64, false),
+            Field::new("b", DataType::UInt64, false),
+            Field::new("c", DataType::UInt64, false),
+        ]);
+
+        let plan = table_scan(Some("table"), &schema, None)
+            .unwrap()
+            .filter(
+                cast(col("a"), DataType::Int64)
+                    .lt(lit(1_i64))
+                    .and(cast(col("a"), DataType::Int64).not_eq(lit(1_i64))),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let rule = CommonSubexprEliminate {};
+        let optimized_plan = rule
+            .try_optimize(&plan, &OptimizerContext::new())
+            .unwrap()
+            .unwrap();
+
+        let schema = optimized_plan.schema();
+        let fields_with_datatypes: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|field| (field.name(), field.data_type()))
+            .collect();
+        let formatted_fields_with_datatype = format!("{fields_with_datatypes:#?}");
+        let expected = r###"[
+    (
+        "a",
+        UInt64,
+    ),
+    (
+        "b",
+        UInt64,
+    ),
+    (
+        "c",
+        UInt64,
+    ),
+]"###;
+        assert_eq!(expected, formatted_fields_with_datatype);
+    }
+
+    #[test]
+    fn filter_schema_changed() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(lit(1).gt(col("a")).and(lit(1).gt(col("a"))))?
+            .build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: Int32(1) > test.atest.aInt32(1) AS Int32(1) > test.a AND Int32(1) > test.atest.aInt32(1) AS Int32(1) > test.a\
+        \n    Projection: Int32(1) > test.a AS Int32(1) > test.atest.aInt32(1), test.a, test.b, test.c\
+        \n      TableScan: test";
+
+        assert_optimized_plan_eq(expected, &plan);
+
+        Ok(())
     }
 }

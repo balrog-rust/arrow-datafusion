@@ -20,6 +20,9 @@
 # SELECT syntax
 
 The queries in DataFusion scan data from tables and return 0 or more rows.
+Please be aware that column names in queries are made lower-case, but not on the inferred schema. Accordingly, if you
+want to query against a capitalized field, make sure to use double quotes. Please see this
+[example](https://arrow.apache.org/datafusion/user-guide/example-usage.html) for clarification.
 In this documentation we describe the SQL syntax in DataFusion.
 
 DataFusion supports the following syntax for queries:
@@ -28,6 +31,7 @@ DataFusion supports the following syntax for queries:
 [ [WITH](#with-clause) with_query [, ...] ] <br/>
 [SELECT](#select-clause) [ ALL | DISTINCT ] select_expr [, ...] <br/>
 [ [FROM](#from-clause) from_item [, ...] ] <br/>
+[ [JOIN](#join-clause) join_item [, ...] ] <br/>
 [ [WHERE](#where-clause) condition ] <br/>
 [ [GROUP BY](#group-by-clause) grouping_element [, ...] ] <br/>
 [ [HAVING](#having-clause) condition] <br/>
@@ -75,6 +79,92 @@ Example:
 
 ```sql
 SELECT a FROM table WHERE a > 10
+```
+
+## JOIN clause
+
+DataFusion supports `INNER JOIN`, `LEFT OUTER JOIN`, `RIGHT OUTER JOIN`, `FULL OUTER JOIN`, and `CROSS JOIN`.
+
+The following examples are based on this table:
+
+```sql
+select * from x;
++----------+----------+
+| column_1 | column_2 |
++----------+----------+
+| 1        | 2        |
++----------+----------+
+```
+
+### INNER JOIN
+
+The keywords `JOIN` or `INNER JOIN` define a join that only shows rows where there is a match in both tables.
+
+```sql
+❯ select * from x inner join x y ON x.column_1 = y.column_1;
++----------+----------+----------+----------+
+| column_1 | column_2 | column_1 | column_2 |
++----------+----------+----------+----------+
+| 1        | 2        | 1        | 2        |
++----------+----------+----------+----------+
+```
+
+### LEFT OUTER JOIN
+
+The keywords `LEFT JOIN` or `LEFT OUTER JOIN` define a join that includes all rows from the left table even if there
+is not a match in the right table. When there is no match, null values are produced for the right side of the join.
+
+```sql
+❯ select * from x left join x y ON x.column_1 = y.column_2;
++----------+----------+----------+----------+
+| column_1 | column_2 | column_1 | column_2 |
++----------+----------+----------+----------+
+| 1        | 2        |          |          |
++----------+----------+----------+----------+
+```
+
+### RIGHT OUTER JOIN
+
+The keywords `RIGHT JOIN` or `RIGHT OUTER JOIN` define a join that includes all rows from the right table even if there
+is not a match in the left table. When there is no match, null values are produced for the left side of the join.
+
+```sql
+❯ select * from x right join x y ON x.column_1 = y.column_2;
++----------+----------+----------+----------+
+| column_1 | column_2 | column_1 | column_2 |
++----------+----------+----------+----------+
+|          |          | 1        | 2        |
++----------+----------+----------+----------+
+```
+
+### FULL OUTER JOIN
+
+The keywords `FULL JOIN` or `FULL OUTER JOIN` define a join that is effectively a union of a `LEFT OUTER JOIN` and
+`RIGHT OUTER JOIN`. It will show all rows from the left and right side of the join and will produce null values on
+either side of the join where there is not a match.
+
+```sql
+❯ select * from x full outer join x y ON x.column_1 = y.column_2;
++----------+----------+----------+----------+
+| column_1 | column_2 | column_1 | column_2 |
++----------+----------+----------+----------+
+| 1        | 2        |          |          |
+|          |          | 1        | 2        |
++----------+----------+----------+----------+
+```
+
+### CROSS JOIN
+
+A cross join produces a cartesian product that matches every row in the left side of the join with every row in the
+right side of the join.
+
+```sql
+❯ select * from x cross join x y;
++----------+----------+----------+----------+
+| column_1 | column_2 | column_1 | column_2 |
++----------+----------+----------+----------+
+| 1        | 2        | 1        | 2        |
++----------+----------+----------+----------+
 ```
 
 ## GROUP BY clause

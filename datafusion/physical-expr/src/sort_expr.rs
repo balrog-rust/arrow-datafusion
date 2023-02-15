@@ -33,6 +33,12 @@ pub struct PhysicalSortExpr {
     pub options: SortOptions,
 }
 
+impl PartialEq for PhysicalSortExpr {
+    fn eq(&self, other: &PhysicalSortExpr) -> bool {
+        self.options == other.options && self.expr.eq(&other.expr)
+    }
+}
+
 impl std::fmt::Display for PhysicalSortExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let opts_string = match (self.options.descending, self.options.nulls_first) {
@@ -54,8 +60,7 @@ impl PhysicalSortExpr {
             ColumnarValue::Array(array) => array,
             ColumnarValue::Scalar(scalar) => {
                 return Err(DataFusionError::Plan(format!(
-                    "Sort operation is not applicable to scalar value {}",
-                    scalar
+                    "Sort operation is not applicable to scalar value {scalar}"
                 )));
             }
         };

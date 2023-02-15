@@ -22,8 +22,8 @@ use std::fmt;
 
 /// Formats plans with a single line per node. For example:
 ///
-/// Projection: #id
-///    Filter: #state Eq Utf8(\"CO\")\
+/// Projection: id
+///    Filter: state Eq Utf8(\"CO\")\
 ///       CsvScan: employee.csv projection=Some([0, 3])";
 pub struct IndentVisitor<'a, 'b> {
     f: &'a mut fmt::Formatter<'b>,
@@ -48,7 +48,7 @@ impl<'a, 'b> IndentVisitor<'a, 'b> {
 impl<'a, 'b> PlanVisitor for IndentVisitor<'a, 'b> {
     type Error = fmt::Error;
 
-    fn pre_visit(&mut self, plan: &LogicalPlan) -> std::result::Result<bool, fmt::Error> {
+    fn pre_visit(&mut self, plan: &LogicalPlan) -> Result<bool, fmt::Error> {
         if self.indent > 0 {
             writeln!(self.f)?;
         }
@@ -66,10 +66,7 @@ impl<'a, 'b> PlanVisitor for IndentVisitor<'a, 'b> {
         Ok(true)
     }
 
-    fn post_visit(
-        &mut self,
-        _plan: &LogicalPlan,
-    ) -> std::result::Result<bool, fmt::Error> {
+    fn post_visit(&mut self, _plan: &LogicalPlan) -> Result<bool, fmt::Error> {
         self.indent -= 1;
         Ok(true)
     }
@@ -145,7 +142,7 @@ impl GraphvizBuilder {
     /// makes a quoted string suitable for inclusion in a graphviz chart
     fn quoted(label: &str) -> String {
         let label = label.replace('"', "_");
-        format!("\"{}\"", label)
+        format!("\"{label}\"")
     }
 }
 
@@ -190,7 +187,7 @@ impl<'a, 'b> GraphvizVisitor<'a, 'b> {
 impl<'a, 'b> PlanVisitor for GraphvizVisitor<'a, 'b> {
     type Error = fmt::Error;
 
-    fn pre_visit(&mut self, plan: &LogicalPlan) -> std::result::Result<bool, fmt::Error> {
+    fn pre_visit(&mut self, plan: &LogicalPlan) -> Result<bool, fmt::Error> {
         let id = self.graphviz_builder.next_id();
 
         // Create a new graph node for `plan` such as
@@ -217,8 +214,7 @@ impl<'a, 'b> PlanVisitor for GraphvizVisitor<'a, 'b> {
         if let Some(parent_id) = self.parent_ids.last() {
             writeln!(
                 self.f,
-                "    {} -> {} [arrowhead=none, arrowtail=normal, dir=back]",
-                parent_id, id
+                "    {parent_id} -> {id} [arrowhead=none, arrowtail=normal, dir=back]"
             )?;
         }
 
@@ -226,13 +222,14 @@ impl<'a, 'b> PlanVisitor for GraphvizVisitor<'a, 'b> {
         Ok(true)
     }
 
-    fn post_visit(
-        &mut self,
-        _plan: &LogicalPlan,
-    ) -> std::result::Result<bool, fmt::Error> {
+    fn post_visit(&mut self, _plan: &LogicalPlan) -> Result<bool, fmt::Error> {
         // always be non-empty as pre_visit always pushes
-        self.parent_ids.pop().unwrap();
-        Ok(true)
+        // So it should always be Ok(true)
+        let res = self.parent_ids.pop();
+        match res {
+            Some(_) => Ok(true),
+            None => Err(fmt::Error),
+        }
     }
 }
 

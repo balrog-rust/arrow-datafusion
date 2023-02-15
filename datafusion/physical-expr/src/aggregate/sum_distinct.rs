@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::aggregate::sum;
 use crate::expressions::format_state_name;
 use arrow::datatypes::{DataType, Field};
 use std::any::Any;
@@ -29,7 +28,7 @@ use std::collections::HashSet;
 use crate::{AggregateExpr, PhysicalExpr};
 use datafusion_common::ScalarValue;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_expr::{Accumulator, AggregateState};
+use datafusion_expr::Accumulator;
 
 /// Expression for a SUM(DISTINCT) aggregation.
 #[derive(Debug)]
@@ -69,7 +68,7 @@ impl AggregateExpr for DistinctSum {
     fn state_fields(&self) -> Result<Vec<Field>> {
         // State field is a List which stores items to rebuild hash set.
         Ok(vec![Field::new(
-            &format_state_name(&self.name, "sum distinct"),
+            format_state_name(&self.name, "sum distinct"),
             DataType::List(Box::new(Field::new("item", self.data_type.clone(), true))),
             false,
         )])
@@ -120,15 +119,14 @@ impl DistinctSumAccumulator {
         states.iter().try_for_each(|state| match state {
             ScalarValue::List(Some(values), _) => self.update(values.as_ref()),
             _ => Err(DataFusionError::Internal(format!(
-                "Unexpected accumulator state {:?}",
-                state
+                "Unexpected accumulator state {state:?}"
             ))),
         })
     }
 }
 
 impl Accumulator for DistinctSumAccumulator {
-    fn state(&self) -> Result<Vec<AggregateState>> {
+    fn state(&self) -> Result<Vec<ScalarValue>> {
         // 1. Stores aggregate state in `ScalarValue::List`
         // 2. Constructs `ScalarValue::List` state from distinct numeric stored in hash set
         let state_out = {
@@ -136,10 +134,10 @@ impl Accumulator for DistinctSumAccumulator {
             self.hash_values
                 .iter()
                 .for_each(|distinct_value| distinct_values.push(distinct_value.clone()));
-            vec![AggregateState::Scalar(ScalarValue::List(
+            vec![ScalarValue::new_list(
                 Some(distinct_values),
-                Box::new(Field::new("item", self.data_type.clone(), true)),
-            ))]
+                self.data_type.clone(),
+            )]
         };
         Ok(state_out)
     }
@@ -171,17 +169,23 @@ impl Accumulator for DistinctSumAccumulator {
 
     fn evaluate(&self) -> Result<ScalarValue> {
         let mut sum_value = ScalarValue::try_from(&self.data_type)?;
-        self.hash_values.iter().for_each(|distinct_value| {
-            sum_value = sum::sum(&sum_value, distinct_value).unwrap()
-        });
+        for distinct_value in self.hash_values.iter() {
+            sum_value = sum_value.add(distinct_value)?;
+        }
         Ok(sum_value)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self) + ScalarValue::size_of_hashset(&self.hash_values)
+            - std::mem::size_of_val(&self.hash_values)
+            + self.data_type.size()
+            - std::mem::size_of_val(&self.data_type)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregate::utils::get_accum_scalar_values;
     use crate::expressions::col;
     use crate::expressions::tests::aggregate;
     use arrow::record_batch::RecordBatch;
@@ -197,11 +201,11 @@ mod tests {
         let mut accum = agg.create_accumulator()?;
         accum.update_batch(arrays)?;
 
-        Ok((get_accum_scalar_values(accum.as_ref())?, accum.evaluate()?))
+        Ok((accum.state()?, accum.evaluate()?))
     }
 
     macro_rules! generic_test_sum_distinct {
-        ($ARRAY:expr, $DATATYPE:expr, $EXPECTED:expr, $EXPECTED_DATATYPE:expr) => {{
+        ($ARRAY:expr, $DATATYPE:expr, $EXPECTED:expr) => {{
             let schema = Schema::new(vec![Field::new("a", $DATATYPE, true)]);
 
             let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![$ARRAY])?;
@@ -209,7 +213,7 @@ mod tests {
             let agg = Arc::new(DistinctSum::new(
                 vec![col("a", &schema)?],
                 "count_distinct_a".to_string(),
-                $EXPECTED_DATATYPE,
+                $EXPECTED.get_datatype(),
             ));
             let actual = aggregate(&batch, agg)?;
             let expected = ScalarValue::from($EXPECTED);
@@ -242,12 +246,7 @@ mod tests {
             Some(2),
             Some(3),
         ]));
-        generic_test_sum_distinct!(
-            array,
-            DataType::Int32,
-            ScalarValue::from(6i64),
-            DataType::Int64
-        )
+        generic_test_sum_distinct!(array, DataType::Int32, ScalarValue::from(6_i32))
     }
 
     #[test]
@@ -259,24 +258,14 @@ mod tests {
             Some(3_u32),
             None,
         ]));
-        generic_test_sum_distinct!(
-            array,
-            DataType::UInt32,
-            ScalarValue::from(4i64),
-            DataType::Int64
-        )
+        generic_test_sum_distinct!(array, DataType::UInt32, ScalarValue::from(4_u32))
     }
 
     #[test]
     fn sum_distinct_f64() -> Result<()> {
         let array: ArrayRef =
             Arc::new(Float64Array::from(vec![1_f64, 1_f64, 3_f64, 3_f64, 3_f64]));
-        generic_test_sum_distinct!(
-            array,
-            DataType::Float64,
-            ScalarValue::from(4_f64),
-            DataType::Float64
-        )
+        generic_test_sum_distinct!(array, DataType::Float64, ScalarValue::from(4_f64))
     }
 
     #[test]
@@ -290,8 +279,7 @@ mod tests {
         generic_test_sum_distinct!(
             array,
             DataType::Decimal128(35, 0),
-            ScalarValue::Decimal128(Some(1), 38, 0),
-            DataType::Decimal128(38, 0)
+            ScalarValue::Decimal128(Some(1), 38, 0)
         )
     }
 }

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::{
     error::{DataFusionError, Result},
-    logical_plan::StringifiedPlan,
+    logical_expr::StringifiedPlan,
     physical_plan::{
         common::SizedRecordBatchStream, DisplayFormatType, ExecutionPlan, Partitioning,
         Statistics,
@@ -97,10 +97,6 @@ impl ExecutionPlan for ExplainExec {
         None
     }
 
-    fn relies_on_input_order(&self) -> bool {
-        false
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
@@ -116,13 +112,14 @@ impl ExecutionPlan for ExplainExec {
         debug!("Start ExplainExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
         if 0 != partition {
             return Err(DataFusionError::Internal(format!(
-                "ExplainExec invalid partition {}",
-                partition
+                "ExplainExec invalid partition {partition}"
             )));
         }
 
-        let mut type_builder = StringBuilder::new(self.stringified_plans.len());
-        let mut plan_builder = StringBuilder::new(self.stringified_plans.len());
+        let mut type_builder =
+            StringBuilder::with_capacity(self.stringified_plans.len(), 1024);
+        let mut plan_builder =
+            StringBuilder::with_capacity(self.stringified_plans.len(), 1024);
 
         let plans_to_print = self
             .stringified_plans
@@ -154,7 +151,8 @@ impl ExecutionPlan for ExplainExec {
         )?;
 
         let metrics = ExecutionPlanMetricsSet::new();
-        let tracking_metrics = MemTrackingMetrics::new(&metrics, partition);
+        let tracking_metrics =
+            MemTrackingMetrics::new(&metrics, context.memory_pool(), partition);
 
         debug!(
             "Before returning SizedRecordBatch in ExplainExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());

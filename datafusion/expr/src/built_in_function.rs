@@ -73,7 +73,7 @@ pub enum BuiltinScalarFunction {
 
     // string functions
     /// construct an array from columns
-    Array,
+    MakeArray,
     /// ascii
     Ascii,
     /// bit_length
@@ -156,16 +156,24 @@ pub enum BuiltinScalarFunction {
     FromUnixtime,
     ///now
     Now,
+    ///current_date
+    CurrentDate,
+    /// current_time
+    CurrentTime,
     /// translate
     Translate,
     /// trim
     Trim,
     /// upper
     Upper,
+    /// uuid
+    Uuid,
     /// regexp_match
     RegexpMatch,
-    ///struct
+    /// struct
     Struct,
+    /// arrow_typeof
+    ArrowTypeof,
 }
 
 impl BuiltinScalarFunction {
@@ -174,7 +182,11 @@ impl BuiltinScalarFunction {
     pub fn supports_zero_argument(&self) -> bool {
         matches!(
             self,
-            BuiltinScalarFunction::Random | BuiltinScalarFunction::Now
+            BuiltinScalarFunction::Random
+                | BuiltinScalarFunction::Now
+                | BuiltinScalarFunction::CurrentDate
+                | BuiltinScalarFunction::CurrentTime
+                | BuiltinScalarFunction::Uuid
         )
     }
     /// Returns the [Volatility] of the builtin function.
@@ -202,7 +214,7 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::Sqrt => Volatility::Immutable,
             BuiltinScalarFunction::Tan => Volatility::Immutable,
             BuiltinScalarFunction::Trunc => Volatility::Immutable,
-            BuiltinScalarFunction::Array => Volatility::Immutable,
+            BuiltinScalarFunction::MakeArray => Volatility::Immutable,
             BuiltinScalarFunction::Ascii => Volatility::Immutable,
             BuiltinScalarFunction::BitLength => Volatility::Immutable,
             BuiltinScalarFunction::Btrim => Volatility::Immutable,
@@ -248,12 +260,16 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::RegexpMatch => Volatility::Immutable,
             BuiltinScalarFunction::Struct => Volatility::Immutable,
             BuiltinScalarFunction::FromUnixtime => Volatility::Immutable,
+            BuiltinScalarFunction::ArrowTypeof => Volatility::Immutable,
 
             // Stable builtin functions
             BuiltinScalarFunction::Now => Volatility::Stable,
+            BuiltinScalarFunction::CurrentDate => Volatility::Stable,
+            BuiltinScalarFunction::CurrentTime => Volatility::Stable,
 
             // Volatile builtin functions
             BuiltinScalarFunction::Random => Volatility::Volatile,
+            BuiltinScalarFunction::Uuid => Volatility::Volatile,
         }
     }
 }
@@ -261,7 +277,7 @@ impl BuiltinScalarFunction {
 impl fmt::Display for BuiltinScalarFunction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // lowercase of the debug.
-        write!(f, "{}", format!("{:?}", self).to_lowercase())
+        write!(f, "{}", format!("{self:?}").to_lowercase())
     }
 }
 
@@ -294,8 +310,10 @@ impl FromStr for BuiltinScalarFunction {
             // conditional functions
             "coalesce" => BuiltinScalarFunction::Coalesce,
 
+            // array functions
+            "make_array" => BuiltinScalarFunction::MakeArray,
+
             // string functions
-            "array" => BuiltinScalarFunction::Array,
             "ascii" => BuiltinScalarFunction::Ascii,
             "bit_length" => BuiltinScalarFunction::BitLength,
             "btrim" => BuiltinScalarFunction::Btrim,
@@ -304,6 +322,8 @@ impl FromStr for BuiltinScalarFunction {
             "concat" => BuiltinScalarFunction::Concat,
             "concat_ws" => BuiltinScalarFunction::ConcatWithSeparator,
             "chr" => BuiltinScalarFunction::Chr,
+            "current_date" => BuiltinScalarFunction::CurrentDate,
+            "current_time" => BuiltinScalarFunction::CurrentTime,
             "date_part" | "datepart" => BuiltinScalarFunction::DatePart,
             "date_trunc" | "datetrunc" => BuiltinScalarFunction::DateTrunc,
             "date_bin" => BuiltinScalarFunction::DateBin,
@@ -342,13 +362,14 @@ impl FromStr for BuiltinScalarFunction {
             "translate" => BuiltinScalarFunction::Translate,
             "trim" => BuiltinScalarFunction::Trim,
             "upper" => BuiltinScalarFunction::Upper,
+            "uuid" => BuiltinScalarFunction::Uuid,
             "regexp_match" => BuiltinScalarFunction::RegexpMatch,
             "struct" => BuiltinScalarFunction::Struct,
             "from_unixtime" => BuiltinScalarFunction::FromUnixtime,
+            "arrow_typeof" => BuiltinScalarFunction::ArrowTypeof,
             _ => {
                 return Err(DataFusionError::Plan(format!(
-                    "There is no built-in function named {}",
-                    name
+                    "There is no built-in function named {name}"
                 )))
             }
         })
